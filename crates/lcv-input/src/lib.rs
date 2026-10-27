@@ -103,6 +103,9 @@ impl Injector {
     }
 
     fn key(&mut self, scancode: u16, extended: bool, down: bool) {
+        if scancode == 0x5B || scancode == 0x5C {
+            tracing::info!("inyectada tecla Windows (down={down}, ext={extended})");
+        }
         if down {
             self.keys_down.insert(scancode | if extended { 0x8000 } else { 0 });
         } else {

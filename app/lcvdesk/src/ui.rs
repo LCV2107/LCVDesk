@@ -687,11 +687,10 @@ impl App {
         });
         if status_text.is_none() {
             ui.label(
-                RichText::new(if self.controlling {
-                    "Controlando: tu ratón y teclado van al equipo remoto. Haz clic fuera de la imagen para soltar el control."
-                } else {
-                    "Haz clic en la imagen para controlar el equipo remoto."
-                })
+                RichText::new(
+                    "Tu ratón y teclado controlan el equipo remoto mientras esta ventana esté activa \
+                     (la tecla Windows, Alt+Tab, etc. van al remoto). Cambia de ventana para soltar.",
+                )
                 .small()
                 .color(Color32::GRAY),
             );
@@ -754,28 +753,30 @@ impl App {
         });
     }
 
-    /// Reenvía ratón y teclado al host cuando la vista remota tiene el control.
+    /// Reenvía ratón y teclado al host mientras la ventana de la sesión esté activa (enfocada),
+    /// como RustDesk/AnyDesk: no hace falta "tomar control" con un clic previo.
     fn handle_control(&mut self, ui: &egui::Ui, response: &egui::Response, image_rect: Option<Rect>) {
+        let _ = response;
         let Some(viewer) = self.viewer.as_ref() else { return };
-        let Some(rect) = image_rect else { return };
+        let Some(rect) = image_rect else {
+            keyhook::set_grab(false);
+            return;
+        };
 
-        if response.clicked() {
-            response.request_focus();
-            self.controlling = true;
-        }
-        if response.clicked_elsewhere() && self.controlling {
-            viewer.send(&Message::ReleaseAll);
-            self.sent_mods = Modifiers::default();
-            self.controlling = false;
-        }
-
-        // Con el hook instalado, el teclado (incluida la tecla Windows, Alt+Tab, etc.) se captura a
-        // bajo nivel mientras controlas y la ventana está en primer plano (lo verifica el propio hook).
+        // Activo mientras la ventana de LCVDesk esté enfocada. El hook además comprueba que estemos
+        // en primer plano, así que no robamos el teclado a otras aplicaciones.
+        let active = ui.ctx().input(|i| i.focused);
         let use_hook = keyhook::installed();
-        keyhook::set_grab(self.controlling && use_hook);
-        if !self.controlling {
+        keyhook::set_grab(active && use_hook);
+        if !active {
+            if self.controlling {
+                viewer.send(&Message::ReleaseAll);
+                self.sent_mods = Modifiers::default();
+                self.controlling = false;
+            }
             return;
         }
+        self.controlling = true;
 
         // --- Ratón: posición normalizada 0..=65535 sobre la imagen remota. ---
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {

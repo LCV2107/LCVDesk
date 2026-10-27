@@ -87,6 +87,11 @@ impl Viewer {
                         if st.load(Ordering::Relaxed) {
                             break;
                         }
+                        if let Message::Key { scancode, down, .. } = &msg {
+                            if *scancode == 0x5B || *scancode == 0x5C {
+                                info!("reenviada tecla Windows (down={down})");
+                            }
+                        }
                         if let Some(s) = lock(&wr).as_mut() {
                             let _ = write_message(s, &msg);
                         }
