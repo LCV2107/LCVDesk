@@ -305,17 +305,38 @@ fn describe(e: ureq::Error) -> String {
     }
 }
 
-type Ver = (u32, u32, u32, bool);
+// (major, minor, patch, orden_de_prerelease). El 4º campo ordena las betas entre sí: una versión
+// final es u64::MAX (por encima de cualquier beta); una beta.N vale peso_de_tipo + N.
+type Ver = (u32, u32, u32, u64);
 
-/// Analiza "v1.2.3" o "1.2.3-beta". El cuarto campo es true si NO es prerelease (ordena por encima).
+/// Analiza "v1.2.3", "1.2.3-beta.3" o "1.2.3-rc.1".
 fn parse_version(tag: &str) -> Option<Ver> {
     let s = tag.trim().trim_start_matches(['v', 'V']);
-    let (core, pre) = s.split_once('-').map_or((s, false), |(c, _)| (c, true));
+    let (core, pre) = s.split_once('-').map_or((s, ""), |(c, p)| (c, p));
     let mut it = core.split('.');
     let major = it.next()?.parse().ok()?;
     let minor = it.next()?.parse().ok()?;
     let patch = it.next().unwrap_or("0").parse().ok()?;
-    Some((major, minor, patch, !pre))
+    let pre_order = if pre.is_empty() { u64::MAX } else { prerelease_order(pre) };
+    Some((major, minor, patch, pre_order))
+}
+
+/// Orden de un identificador de prerelease: rc > beta > alpha, y dentro de cada uno por su número.
+fn prerelease_order(pre: &str) -> u64 {
+    let low = pre.to_lowercase();
+    let base = if low.starts_with("rc") {
+        3_000_000
+    } else if low.starts_with("beta") {
+        2_000_000
+    } else if low.starts_with("alpha") {
+        1_000_000
+    } else {
+        0
+    };
+    // Número al final (beta.3 -> 3, beta.10 -> 10).
+    let rev_digits: String = low.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+    let num: u64 = rev_digits.chars().rev().collect::<String>().parse().unwrap_or(0);
+    base + num.min(999_999)
 }
 
 fn cmp(a: &Ver, b: &Ver) -> i32 {
@@ -324,8 +345,10 @@ fn cmp(a: &Ver, b: &Ver) -> i32 {
             return if x > y { 1 } else { -1 };
         }
     }
-    // Una versión final (a.3 == true) va por encima de la misma con prerelease.
-    (a.3 as i32) - (b.3 as i32)
+    if a.3 != b.3 {
+        return if a.3 > b.3 { 1 } else { -1 };
+    }
+    0
 }
 
 #[cfg(test)]
@@ -340,5 +363,11 @@ mod tests {
         assert!(cmp(&v("1.2.3"), &v("1.2.3")) == 0);
         assert!(cmp(&v("1.2.3"), &v("1.2.3-beta")) > 0);
         assert!(cmp(&v("1.2.0"), &v("1.10.0")) < 0);
+        // Las betas se ordenan por su número, y la final va por encima de cualquier beta.
+        assert!(cmp(&v("0.3.0-beta.3"), &v("0.3.0-beta.1")) > 0);
+        assert!(cmp(&v("0.3.0-beta.10"), &v("0.3.0-beta.2")) > 0);
+        assert!(cmp(&v("0.3.0"), &v("0.3.0-beta.9")) > 0);
+        assert!(cmp(&v("0.3.1-beta.1"), &v("0.3.0-beta.1")) > 0);
+        assert!(cmp(&v("1.0.0-rc.1"), &v("1.0.0-beta.9")) > 0);
     }
 }
