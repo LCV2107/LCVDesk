@@ -1852,7 +1852,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lcv-capture"
-version = "0.3.0"
+version = "0.1.0"
 dependencies = [
  "thiserror 2.0.21",
  "tracing",
@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "lcv-codec"
-version = "0.3.0"
+version = "0.1.0"
 dependencies = [
  "lcv-capture",
  "lcv-proto",
@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "lcv-input"
-version = "0.3.0"
+version = "0.1.0"
 dependencies = [
  "lcv-proto",
  "tracing",
@@ -1882,7 +1882,7 @@ dependencies = [
 
 [[package]]
 name = "lcv-proto"
-version = "0.3.0"
+version = "0.1.0"
 dependencies = [
  "postcard",
  "serde",
@@ -1891,7 +1891,7 @@ dependencies = [
 
 [[package]]
 name = "lcvdesk"
-version = "0.3.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "eframe",
