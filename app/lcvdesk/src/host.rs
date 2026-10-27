@@ -146,7 +146,8 @@ fn verify_password(stream: &mut TcpStream) -> anyhow::Result<bool> {
     let Some(password) = crate::auth::load_password() else { return Ok(false) };
     let nonce = crate::auth::random_nonce();
     write_message(stream, &Message::AuthChallenge { nonce: nonce.clone() })?;
-    // El tiempo de espera de lectura (10 s) ya está activo en este punto.
+    // El visor puede estar pidiendo la contraseña al usuario: damos margen para que la escriba.
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
     let mac = match read_message(stream)? {
         Message::AuthResponse { mac } => mac,
         _ => return Ok(false),

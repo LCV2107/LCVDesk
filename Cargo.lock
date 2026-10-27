@@ -1852,7 +1852,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lcv-capture"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "thiserror 2.0.21",
  "tracing",
@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "lcv-codec"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "lcv-capture",
  "lcv-proto",
@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "lcv-input"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "lcv-proto",
  "tracing",
@@ -1882,7 +1882,7 @@ dependencies = [
 
 [[package]]
 name = "lcv-proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "postcard",
  "serde",
@@ -1891,7 +1891,7 @@ dependencies = [
 
 [[package]]
 name = "lcvdesk"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1903,6 +1903,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "tracing",
  "tracing-subscriber",
  "ureq",
@@ -3358,6 +3359,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

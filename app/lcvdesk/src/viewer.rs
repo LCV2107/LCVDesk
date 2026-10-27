@@ -12,6 +12,8 @@ use tracing::{info, warn};
 
 pub enum Status {
     Connecting,
+    /// El host pide contraseña y no hay una guardada: la interfaz debe solicitarla.
+    NeedPassword,
     WaitingAcceptance,
     Streaming,
     Closed(String),
@@ -48,14 +50,18 @@ pub struct Shared {
 
 pub struct Viewer {
     pub target: String,
+    /// Nombre visible del equipo (para mostrarlo al pedir la contraseña).
+    pub display_name: String,
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
     /// Único punto de escritura hacia el host: lo comparten el visor, el "ping" y la interfaz.
     writer: Arc<Mutex<Option<TcpStream>>>,
+    /// La interfaz entrega aquí la contraseña escrita (o `None` al cancelar).
+    pw_tx: std::sync::mpsc::Sender<Option<(String, bool)>>,
 }
 
 impl Viewer {
-    pub fn connect(target: String, password: String, ctx: egui::Context) -> Self {
+    pub fn connect(target: String, display_name: String, initial_password: Option<String>, ctx: egui::Context) -> Self {
         let shared = Arc::new(Mutex::new(Shared {
             status: Status::Connecting,
             frame: None,
@@ -89,11 +95,13 @@ impl Viewer {
                 .ok();
         }
 
+        let (pw_tx, pw_rx) = std::sync::mpsc::channel::<Option<(String, bool)>>();
+
         let (sh, st, wr, t) = (shared.clone(), stop.clone(), writer.clone(), target.clone());
         thread::Builder::new()
             .name("viewer".into())
             .spawn(move || {
-                let result = run(&t, &password, &sh, &st, &wr, &ctx);
+                let result = run(&t, initial_password, pw_rx, &sh, &st, &wr, &ctx);
                 let reason = match result {
                     _ if st.load(Ordering::Relaxed) => "Desconectado".to_string(),
                     Ok(reason) => reason,
@@ -104,7 +112,18 @@ impl Viewer {
                 ctx.request_repaint();
             })
             .ok();
-        Self { target, shared, stop, writer }
+        Self { target, display_name, shared, stop, writer, pw_tx }
+    }
+
+    /// La interfaz entrega la contraseña escrita por el usuario (y si debe recordarse).
+    pub fn provide_password(&self, password: String, remember: bool) {
+        let _ = self.pw_tx.send(Some((password, remember)));
+    }
+
+    /// El usuario canceló el cuadro de contraseña.
+    pub fn cancel_password(&self) {
+        let _ = self.pw_tx.send(None);
+        self.disconnect();
     }
 
     pub fn shared(&self) -> MutexGuard<'_, Shared> {
@@ -144,7 +163,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn run(
     target: &str,
-    password: &str,
+    initial_password: Option<String>,
+    pw_rx: std::sync::mpsc::Receiver<Option<(String, bool)>>,
     shared: &Mutex<Shared>,
     stop: &Arc<AtomicBool>,
     writer: &Arc<Mutex<Option<TcpStream>>>,
@@ -170,12 +190,40 @@ fn run(
     let mut decoder = H264Decoder::new().map_err(std::io::Error::other)?;
     let mut last_keyframe_request: Option<Instant> = None;
     let mut window = Window::new();
+    // Contraseña a usar al llegar el reto (auto-login si venía guardada) y, si procede, a recordar.
+    let mut pending_password = initial_password;
+    let mut remember_after: Option<String> = None;
 
     loop {
         match read_message(&mut stream)? {
             Message::AuthChallenge { nonce } => {
-                // El host pide contraseña: respondemos con HMAC(contraseña, nonce). Si la contraseña
-                // es vacía o incorrecta, el host lo detecta y cae a la aceptación manual.
+                // Si no hay contraseña (ni guardada ni entregada), la interfaz la solicita y esperamos.
+                let password = match pending_password.take() {
+                    Some(p) => p,
+                    None => {
+                        lock(shared).status = Status::NeedPassword;
+                        ctx.request_repaint();
+                        let (pw, remember) = loop {
+                            if stop.load(Ordering::Relaxed) {
+                                return Ok("Desconectado".into());
+                            }
+                            match pw_rx.recv_timeout(Duration::from_millis(250)) {
+                                Ok(Some(v)) => break v,
+                                Ok(None) => return Ok("Conexión cancelada".into()),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    return Ok("Conexión cancelada".into());
+                                }
+                            }
+                        };
+                        lock(shared).status = Status::WaitingAcceptance;
+                        ctx.request_repaint();
+                        if remember {
+                            remember_after = Some(pw.clone());
+                        }
+                        pw
+                    }
+                };
                 let mac = crate::auth::hmac_sha256(password.as_bytes(), &nonce).to_vec();
                 if let Some(s) = lock(writer).as_mut() {
                     write_message(s, &Message::AuthResponse { mac })?;
@@ -183,6 +231,10 @@ fn run(
             }
             Message::Accepted { host_id, host_name, displays, current } => {
                 info!("aceptado por «{host_name}»; {} monitor(es), activo {current}", displays.len());
+                // Si el usuario pidió recordar la contraseña, la guardamos para este equipo.
+                if let Some(pw) = remember_after.take() {
+                    crate::auth::remember_password(&host_id, &pw);
+                }
                 let mut sh = lock(shared);
                 sh.status = Status::Streaming;
                 sh.displays = displays;

@@ -100,8 +100,10 @@ struct App {
     recorded_recent: bool,
     viewer: Option<Viewer>,
     address: String,
-    /// Contraseña que el visor envía al conectarse (vacía = pedir aceptación manual en el otro equipo).
-    connect_password: String,
+    /// Contraseña que el usuario escribe en el cuadro que aparece al conectar.
+    prompt_password: String,
+    /// Marcar "recordar contraseña" en ese cuadro.
+    prompt_remember: bool,
     /// Campo para configurar la contraseña de acceso de ESTE equipo (lado controlado).
     access_password: String,
     /// ¿Hay una contraseña de acceso configurada en este equipo?
@@ -137,7 +139,8 @@ impl App {
             recorded_recent: false,
             viewer: None,
             address: String::new(),
-            connect_password: String::new(),
+            prompt_password: String::new(),
+            prompt_remember: false,
             access_password: String::new(),
             has_access_password: crate::auth::has_password(),
             texture: None,
@@ -290,18 +293,14 @@ impl App {
                 connect = true;
             }
         });
-        ui.horizontal(|ui| {
-            let pw = ui.add(
-                egui::TextEdit::singleline(&mut self.connect_password)
-                    .password(true)
-                    .hint_text("contraseña (si la piden)")
-                    .desired_width(300.0),
-            );
-            connect |= pw.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-        });
+        ui.label(
+            RichText::new("Si el equipo tiene contraseña, se te pedirá al conectar.")
+                .small()
+                .color(Color32::GRAY),
+        );
         if connect {
             let addr = self.address.clone();
-            self.start_connect(addr, ui.ctx());
+            self.start_connect(addr.clone(), addr, None, ui.ctx());
         }
         if let Some(reason) = &self.last_close_reason {
             ui.add_space(6.0);
@@ -389,8 +388,9 @@ impl App {
         });
     }
 
-    /// Inicia una conexión hacia `addr` con la contraseña actual del formulario.
-    fn start_connect(&mut self, addr: String, ctx: &egui::Context) {
+    /// Inicia una conexión a un equipo. Si hay contraseña guardada para ese `id`, entra automáticamente;
+    /// si no y el equipo la pide, el visor la solicitará por pantalla.
+    fn start_connect(&mut self, addr: String, name: String, id: Option<String>, ctx: &egui::Context) {
         if addr.trim().is_empty() {
             return;
         }
@@ -398,7 +398,11 @@ impl App {
         self.last_close_reason = None;
         self.controlling = false;
         self.recorded_recent = false;
-        self.viewer = Some(Viewer::connect(addr.trim().to_string(), self.connect_password.clone(), ctx.clone()));
+        self.prompt_password.clear();
+        self.prompt_remember = false;
+        let initial = id.as_deref().and_then(crate::auth::recall_password);
+        let display = if name.trim().is_empty() { addr.trim().to_string() } else { name };
+        self.viewer = Some(Viewer::connect(addr.trim().to_string(), display, initial, ctx.clone()));
     }
 
     /// Tarjetas de equipos encontrados en la red y de equipos recientes.
@@ -410,17 +414,17 @@ impl App {
         if found.is_empty() {
             ui.label(RichText::new("Buscando equipos con LCVDesk en tu red…").small().color(Color32::GRAY));
         } else {
-            let mut connect_addr = None;
+            let mut connect = None;
             ui.horizontal_wrapped(|ui| {
                 for f in &found {
                     let act = device_card(ui, &f.name, &f.addr, true, f.busy, None);
                     if act.connect {
-                        connect_addr = Some(f.addr.clone());
+                        connect = Some((f.addr.clone(), f.name.clone(), Some(f.id.clone())));
                     }
                 }
             });
-            if let Some(a) = connect_addr {
-                self.start_connect(a, ui.ctx());
+            if let Some((a, n, id)) = connect {
+                self.start_connect(a, n, id, ui.ctx());
             }
         }
 
@@ -432,13 +436,13 @@ impl App {
             return;
         }
         let online: std::collections::HashSet<&str> = found.iter().map(|f| f.id.as_str()).collect();
-        let (mut connect_addr, mut remove_id, mut fav_toggle) = (None, None, None);
+        let (mut connect, mut remove_id, mut fav_toggle) = (None, None, None);
         ui.horizontal_wrapped(|ui| {
             for d in &self.recents {
                 let on = online.contains(d.id.as_str());
                 let act = device_card(ui, &d.name, &d.addr, on, false, Some(d.favorite));
                 if act.connect {
-                    connect_addr = Some(d.addr.clone());
+                    connect = Some((d.addr.clone(), d.name.clone(), Some(d.id.clone())));
                 }
                 if act.favorite {
                     fav_toggle = Some((d.id.clone(), !d.favorite));
@@ -453,11 +457,12 @@ impl App {
             self.recents = recents::load();
         }
         if let Some(id) = remove_id {
+            crate::auth::forget_password(&id);
             recents::remove(&id);
             self.recents = recents::load();
         }
-        if let Some(a) = connect_addr {
-            self.start_connect(a, ui.ctx());
+        if let Some((a, n, id)) = connect {
+            self.start_connect(a, n, id, ui.ctx());
         }
     }
 
@@ -602,16 +607,19 @@ impl App {
     fn remote(&mut self, ui: &mut egui::Ui) {
         let Some(viewer) = self.viewer.as_ref() else { return };
         let target = viewer.target.clone();
-        let (status_text, stats, frame, closed, displays, current, host_id, host_name) = {
+        let name = viewer.display_name.clone();
+        let (status_text, stats, frame, closed, need_password, displays, current, host_id, host_name) = {
             let mut sh = viewer.shared();
             let text = match &sh.status {
                 Status::Connecting => Some(format!("Conectando con {}…", viewer.target)),
+                Status::NeedPassword => None,
                 Status::WaitingAcceptance => Some("Esperando a que el otro usuario acepte…".to_string()),
                 Status::Streaming => None,
                 Status::Closed(r) => Some(r.clone()),
             };
             let closed = matches!(sh.status, Status::Closed(_));
-            (text, sh.stats, sh.frame.take(), closed, sh.displays.clone(), sh.current_display, sh.host_id.clone(), sh.host_name.clone())
+            let need_password = matches!(sh.status, Status::NeedPassword);
+            (text, sh.stats, sh.frame.take(), closed, need_password, sh.displays.clone(), sh.current_display, sh.host_id.clone(), sh.host_name.clone())
         };
 
         if closed {
@@ -619,6 +627,11 @@ impl App {
             self.viewer = None;
             self.controlling = false;
             keyhook::set_grab(false);
+            return;
+        }
+
+        if need_password {
+            self.password_prompt(ui, &name);
             return;
         }
 
@@ -702,6 +715,45 @@ impl App {
         }
     }
 
+    /// Cuadro para introducir la contraseña del equipo al que te conectas (aparece cada vez, salvo
+    /// que esté guardada). Marcar "Recordar" la guarda para entrar automáticamente la próxima vez.
+    fn password_prompt(&mut self, ui: &mut egui::Ui, name: &str) {
+        ui.add_space(48.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("🔒 Contraseña requerida").size(22.0).strong());
+            ui.add_space(6.0);
+            ui.label(format!("El equipo «{name}» pide contraseña para conectar."));
+            ui.add_space(10.0);
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.prompt_password)
+                    .password(true)
+                    .hint_text("contraseña")
+                    .desired_width(240.0),
+            );
+            resp.request_focus();
+            let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            ui.add_space(6.0);
+            ui.checkbox(&mut self.prompt_remember, "Recordar contraseña (entrar automáticamente)");
+            ui.add_space(10.0);
+            let (mut go, mut cancel) = (false, false);
+            ui.horizontal(|ui| {
+                go = ui.button(RichText::new("Conectar").strong()).clicked();
+                cancel = ui.button("Cancelar").clicked();
+            });
+            if go || submit {
+                if let Some(v) = self.viewer.as_ref() {
+                    v.provide_password(self.prompt_password.clone(), self.prompt_remember);
+                }
+                self.prompt_password.clear();
+            }
+            if cancel {
+                if let Some(v) = self.viewer.as_ref() {
+                    v.cancel_password();
+                }
+            }
+        });
+    }
+
     /// Reenvía ratón y teclado al host cuando la vista remota tiene el control.
     fn handle_control(&mut self, ui: &egui::Ui, response: &egui::Response, image_rect: Option<Rect>) {
         let Some(viewer) = self.viewer.as_ref() else { return };
@@ -711,27 +763,19 @@ impl App {
             response.request_focus();
             self.controlling = true;
         }
-        if response.clicked_elsewhere() {
-            if self.controlling {
-                viewer.send(&Message::ReleaseAll);
-                self.sent_mods = Modifiers::default();
-            }
+        if response.clicked_elsewhere() && self.controlling {
+            viewer.send(&Message::ReleaseAll);
+            self.sent_mods = Modifiers::default();
             self.controlling = false;
-        }
-        if !self.controlling || !response.has_focus() {
-            if self.controlling {
-                viewer.send(&Message::ReleaseAll);
-                self.sent_mods = Modifiers::default();
-                self.controlling = false;
-            }
-            keyhook::set_grab(false);
-            return;
         }
 
         // Con el hook instalado, el teclado (incluida la tecla Windows, Alt+Tab, etc.) se captura a
-        // bajo nivel y se reenvía como scancodes; no usamos los eventos de teclado de egui.
+        // bajo nivel mientras controlas y la ventana está en primer plano (lo verifica el propio hook).
         let use_hook = keyhook::installed();
-        keyhook::set_grab(use_hook);
+        keyhook::set_grab(self.controlling && use_hook);
+        if !self.controlling {
+            return;
+        }
 
         // --- Ratón: posición normalizada 0..=65535 sobre la imagen remota. ---
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {

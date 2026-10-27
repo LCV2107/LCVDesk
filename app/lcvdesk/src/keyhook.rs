@@ -16,8 +16,9 @@ use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, SetWindowsHookExW,
-    WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, HC_ACTION,
+    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, SetWindowsHookExW, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 /// ¿Está el hook instalado y operativo?
@@ -58,7 +59,23 @@ pub fn installed() -> bool {
 
 /// Activa o desactiva la captura. Se llama cada fotograma según si tienes el control.
 pub fn set_grab(on: bool) {
-    GRAB.store(on, Ordering::Relaxed);
+    if GRAB.swap(on, Ordering::Relaxed) != on {
+        tracing::info!("captura de teclado {}", if on { "activada" } else { "desactivada" });
+    }
+}
+
+/// ¿La ventana en primer plano pertenece a este proceso? Solo capturamos entonces, para no robar
+/// el teclado a otras aplicaciones si cambias de ventana mientras el control sigue activo.
+fn foreground_is_ours() -> bool {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        pid == std::process::id()
+    }
 }
 
 /// Conecta (o desconecta con `None`) el canal al que el hook envía las teclas capturadas.
@@ -67,7 +84,7 @@ pub fn set_sink(tx: Option<Sender<Message>>) {
 }
 
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 && GRAB.load(Ordering::Relaxed) {
+    if code == HC_ACTION as i32 && GRAB.load(Ordering::Relaxed) && foreground_is_ours() {
         let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         let m = wparam.0 as u32;
         let down = m == WM_KEYDOWN || m == WM_SYSKEYDOWN;

@@ -114,6 +114,72 @@ pub fn clear_password() -> bool {
     }
 }
 
+// --- Contraseñas recordadas por equipo (para "entrar automáticamente") ---
+// Se guardan en %LOCALAPPDATA%\LCVDesk\passwords.json como { id_equipo: blob_DPAPI_en_hex }.
+
+fn creds_file() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("LCVDesk")
+        .join("passwords.json")
+}
+
+fn load_creds() -> std::collections::HashMap<String, String> {
+    std::fs::read(creds_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn save_creds(map: &std::collections::HashMap<String, String>) {
+    let path = creds_file();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(map) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Guarda la contraseña de un equipo (cifrada con DPAPI) para no volver a pedirla.
+pub fn remember_password(id: &str, password: &str) {
+    if id.is_empty() {
+        return;
+    }
+    if let Some(blob) = protect(password.as_bytes()) {
+        let mut map = load_creds();
+        map.insert(id.to_string(), to_hex(&blob));
+        save_creds(&map);
+    }
+}
+
+/// Devuelve la contraseña recordada de un equipo, si la hay.
+pub fn recall_password(id: &str) -> Option<String> {
+    if id.is_empty() {
+        return None;
+    }
+    let hex = load_creds().remove(id)?;
+    let blob = from_hex(&hex)?;
+    String::from_utf8(unprotect(&blob)?).ok()
+}
+
+/// Olvida la contraseña recordada de un equipo.
+pub fn forget_password(id: &str) {
+    let mut map = load_creds();
+    if map.remove(id).is_some() {
+        save_creds(&map);
+    }
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+}
+
 fn protect(plain: &[u8]) -> Option<Vec<u8>> {
     use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::Cryptography::{CRYPT_INTEGER_BLOB, CryptProtectData};

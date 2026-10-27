@@ -154,8 +154,13 @@ impl Discovery {
 }
 
 /// Abre un socket UDP unido al grupo multicast en el puerto de descubrimiento.
+/// Con SO_REUSEADDR para no chocar con otra instancia ni al reiniciar (patrón habitual en multicast).
 fn bind_multicast(group: Ipv4Addr) -> std::io::Result<UdpSocket> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT))?;
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_reuse_address(true)?;
+    sock.bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT)))?;
+    let socket: UdpSocket = sock.into();
     socket.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)?;
     let _ = socket.set_multicast_loop_v4(true);
     Ok(socket)
