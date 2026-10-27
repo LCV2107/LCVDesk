@@ -13,31 +13,59 @@ ofrece instalar la nueva versión.
 3. Si el repositorio es privado, el updater de la app (que no se autentica) no verá las Releases;
    para actualización automática el repositorio debe ser **público**, o las Releases deben serlo.
 
-## Publicar una versión nueva
+## Ramas y canales
 
-1. Subir la versión en [Cargo.toml](../Cargo.toml) → `[workspace.package] version = "0.3.0"`.
-2. Confirmar y etiquetar con el **mismo** número, con prefijo `v`:
+- Rama **`main`** = versiones **estables**. Rama **`beta`** = integración y pruebas.
+- La app tiene un **canal** (Ajustes → *Canal de actualizaciones*): **Estable** (por defecto) o **Beta**.
+  - Estable: solo recibe Releases finales.
+  - Beta: recibe también los **prerelease** (y las estables cuando salen).
+- Versionado: las betas apuntan a la próxima estable → `0.2.0-beta.1`, `-beta.2`… y luego `0.2.0`.
+  `Cargo.toml` guarda solo la **base** (`0.2.0`); el sufijo viene de la etiqueta y se incrusta en el
+  binario vía `LCVDESK_VERSION` (por eso el mismo commit probado en beta puede re-etiquetarse estable).
+
+## Publicar una beta
+
+1. Trabajar en la rama `beta`. `Cargo.toml` tiene la **base** de la próxima versión (p. ej. `0.2.0`).
+2. Confirmar y etiquetar con el sufijo:
    ```bash
-   git commit -am "LCVDesk 0.3.0"
-   git tag v0.3.0
-   git push origin main --tags
+   git switch beta
+   git commit -am "cambios de la beta"
+   git tag v0.2.0-beta.1
+   git push origin beta
+   git push origin v0.2.0-beta.1
    ```
-3. El flujo [release.yml](../.github/workflows/release.yml) compila y publica solo. La Release queda con
-   `LCVDesk-0.3.0-x64.msi` y `LCVDesk-0.3.0-x64.msi.sha256`.
-   - El cuerpo de la Release son las notas (créalo en GitHub o deja que ponga un texto por defecto).
-   - La etiqueta debe coincidir con `Cargo.toml` o el flujo falla a propósito.
+3. El flujo publica un **prerelease** `LCVDesk-0.2.0-beta.1-x64.msi` (+ `.sha256`). Lo reciben solo los
+   equipos en canal **Beta**.
+
+## Promocionar a estable (tras las pruebas)
+
+El mismo commit probado se etiqueta como estable y se fusiona a `main` (no se recompila algo nuevo):
+```bash
+git tag v0.2.0            # sobre el MISMO commit probado en beta
+git push origin v0.2.0    # el flujo publica la Release estable
+git switch main && git merge --ff-only beta && git push origin main
+```
+
+## Actualizaciones críticas (obligatorias)
+
+- Por defecto las actualizaciones **no son obligatorias**: la app solo muestra un aviso y el usuario
+  decide cuándo instalar.
+- Para **forzar** una actualización (p. ej. un fallo de seguridad), incluir la marca **`[critical]`**
+  en las notas de la Release. La app mostrará una pantalla de *Actualización obligatoria* que solo deja
+  actualizar o salir (no interrumpe una sesión en curso; el bloqueo aparece al volver al inicio).
 
 ## Cómo actualiza el usuario
 
-- Al abrir LCVDesk, comprueba en segundo plano si hay una versión mayor.
-- En la pantalla de inicio, sección **Actualizaciones**: muestra la versión instalada, un botón
-  **Buscar actualizaciones** y, si hay una nueva, **Descargar e instalar**.
+- Al abrir LCVDesk comprueba en segundo plano si hay una versión nueva en su canal.
+- Si la hay y **no es crítica**: aparece un aviso discreto arriba («Actualización disponible») con
+  **Instalar** o **Ahora no**; también en Ajustes → *Actualizaciones*.
+- Si es **crítica**: pantalla de actualización obligatoria.
 - Al instalar: descarga el MSI, **verifica su SHA-256**, pide confirmación de administrador (UAC) y lo
-  instala encima (actualización mayor). LCVDesk se cierra para no bloquear archivos; al terminar, se
-  vuelve a abrir desde el menú Inicio.
+  instala encima. LCVDesk se cierra para no bloquear archivos; al terminar se vuelve a abrir.
 
 ## Notas
 
-- Las versiones **prerelease** de GitHub se ignoran (solo se ofrecen las estables).
 - La verificación SHA-256 es obligatoria: si la Release no trae el `.sha256`, la app no instala.
-- Build local del MSI y su huella: `.\tools\build-msi.ps1` (genera también el `.sha256`).
+- Build local del MSI y su huella: `.\tools\build-msi.ps1 [-Version 0.2.0-beta.1]` (genera el `.sha256`).
+- Para probar una beta por primera vez desde un equipo en estable: instalar el MSI de la beta a mano
+  una vez (el updater estable no ofrece prereleases); a partir de ahí, cambiar el canal a Beta.

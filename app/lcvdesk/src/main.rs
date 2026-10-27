@@ -1,8 +1,14 @@
 // Sin consola en release: es una aplicación de ventana.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod auth;
+mod discovery;
 mod host;
+mod identity;
+mod keyhook;
 mod keymap;
+mod recents;
+mod settings;
 mod uac;
 mod ui;
 mod updater;
@@ -18,11 +24,21 @@ fn main() -> anyhow::Result<()> {
         );
     }
     init_logging();
-    tracing::info!("LCVDesk {} iniciado", env!("CARGO_PKG_VERSION"));
+    tracing::info!("LCVDesk {} iniciado", updater::current_version());
+
+    // Hook de teclado de bajo nivel para reenviar las teclas del sistema (tecla Windows, Alt+Tab…)
+    // al equipo remoto mientras controlas, en vez de que las procese este PC.
+    keyhook::start();
 
     let port = env_or("LCVDESK_PORT", lcv_proto::DEFAULT_PORT);
     let host = host::Host::start(port);
-    ui::run(host)
+    let discovery = discovery::Discovery::start(
+        identity::machine_id(),
+        identity::machine_name(),
+        port,
+        host.busy_flag(),
+    );
+    ui::run(host, discovery)
 }
 
 /// Variable de entorno numérica con valor por defecto (útil para pruebas de rendimiento).

@@ -41,6 +41,9 @@ pub struct Shared {
     pub stats: Stats,
     pub displays: Vec<DisplayInfo>,
     pub current_display: u32,
+    /// Identidad del host (llega en `Accepted`); se usa para guardarlo en "Recientes".
+    pub host_id: String,
+    pub host_name: String,
 }
 
 pub struct Viewer {
@@ -52,21 +55,45 @@ pub struct Viewer {
 }
 
 impl Viewer {
-    pub fn connect(target: String, ctx: egui::Context) -> Self {
+    pub fn connect(target: String, password: String, ctx: egui::Context) -> Self {
         let shared = Arc::new(Mutex::new(Shared {
             status: Status::Connecting,
             frame: None,
             stats: Stats::default(),
             displays: Vec::new(),
             current_display: 0,
+            host_id: String::new(),
+            host_name: String::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let writer = Arc::new(Mutex::new(None));
+
+        // Canal del hook de teclado → socket. Un hilo dedicado escribe las teclas capturadas para que
+        // la función del hook (que debe ser muy rápida) nunca bloquee escribiendo en la red.
+        let (key_tx, key_rx) = std::sync::mpsc::channel::<Message>();
+        crate::keyhook::set_sink(Some(key_tx));
+        {
+            let (wr, st) = (writer.clone(), stop.clone());
+            thread::Builder::new()
+                .name("viewer-keys".into())
+                .spawn(move || {
+                    for msg in key_rx {
+                        if st.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if let Some(s) = lock(&wr).as_mut() {
+                            let _ = write_message(s, &msg);
+                        }
+                    }
+                })
+                .ok();
+        }
+
         let (sh, st, wr, t) = (shared.clone(), stop.clone(), writer.clone(), target.clone());
         thread::Builder::new()
             .name("viewer".into())
             .spawn(move || {
-                let result = run(&t, &sh, &st, &wr, &ctx);
+                let result = run(&t, &password, &sh, &st, &wr, &ctx);
                 let reason = match result {
                     _ if st.load(Ordering::Relaxed) => "Desconectado".to_string(),
                     Ok(reason) => reason,
@@ -97,6 +124,8 @@ impl Viewer {
 
     pub fn disconnect(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        crate::keyhook::set_grab(false);
+        crate::keyhook::set_sink(None);
         if let Some(s) = lock(&self.writer).as_ref() {
             let _ = s.shutdown(Shutdown::Both);
         }
@@ -115,6 +144,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn run(
     target: &str,
+    password: &str,
     shared: &Mutex<Shared>,
     stop: &Arc<AtomicBool>,
     writer: &Arc<Mutex<Option<TcpStream>>>,
@@ -143,12 +173,22 @@ fn run(
 
     loop {
         match read_message(&mut stream)? {
-            Message::Accepted { displays, current } => {
-                info!("aceptado; {} monitor(es), activo {current}", displays.len());
+            Message::AuthChallenge { nonce } => {
+                // El host pide contraseña: respondemos con HMAC(contraseña, nonce). Si la contraseña
+                // es vacía o incorrecta, el host lo detecta y cae a la aceptación manual.
+                let mac = crate::auth::hmac_sha256(password.as_bytes(), &nonce).to_vec();
+                if let Some(s) = lock(writer).as_mut() {
+                    write_message(s, &Message::AuthResponse { mac })?;
+                }
+            }
+            Message::Accepted { host_id, host_name, displays, current } => {
+                info!("aceptado por «{host_name}»; {} monitor(es), activo {current}", displays.len());
                 let mut sh = lock(shared);
                 sh.status = Status::Streaming;
                 sh.displays = displays;
                 sh.current_display = current;
+                sh.host_id = host_id;
+                sh.host_name = host_name;
                 drop(sh);
                 spawn_pinger(writer.clone(), stop.clone(), clock);
                 ctx.request_repaint();

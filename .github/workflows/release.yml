@@ -1,9 +1,11 @@
-# Publica una versión de LCVDesk al hacer push de una etiqueta vX.Y.Z.
+# Publica una versión de LCVDesk al hacer push de una etiqueta vX.Y.Z (estable) o vX.Y.Z-beta.N (beta).
 # Compila el MSI, calcula su SHA-256 y crea la Release de GitHub con ambos archivos.
-# El updater de la app lee estas Releases para ofrecer la actualización.
+# Las etiquetas con sufijo (-beta/-rc) se publican como prerelease (canal Beta de la app).
+# El updater lee estas Releases para ofrecer la actualización.
 #
-# Antes de etiquetar: subir la versión en Cargo.toml ([workspace.package] version)
-# y que coincida con la etiqueta (la etiqueta v0.3.0 ⇒ Cargo.toml 0.3.0).
+# La BASE de la etiqueta debe coincidir con Cargo.toml (v0.2.0-beta.1 ⇒ Cargo.toml 0.2.0).
+# La versión completa (con sufijo) se incrusta en el binario vía LCVDESK_VERSION; así el mismo
+# commit probado en beta puede re-etiquetarse como estable sin tocar Cargo.toml.
 name: Publicar versión
 
 on:
@@ -35,17 +37,20 @@ jobs:
           dotnet tool install --global wix --version 5.0.2
           wix extension add -g WixToolset.Firewall.wixext/5.0.2
 
-      - name: Comprobar que la etiqueta coincide con Cargo.toml
+      - name: Comprobar que la base de la etiqueta coincide con Cargo.toml
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          $base = ($version -split '-')[0]
           $cargo = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
             Where-Object name -eq 'lcvdesk' | Select-Object -ExpandProperty version
-          if ($tag -ne $cargo) { throw "La etiqueta ($tag) no coincide con Cargo.toml ($cargo)." }
+          if ($base -ne $cargo) { throw "La base de la etiqueta ($base) no coincide con Cargo.toml ($cargo)." }
 
       - name: Compilar el MSI
         shell: pwsh
-        run: .\tools\build-msi.ps1
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          .\tools\build-msi.ps1 -Version $version
 
       - name: Crear la Release con el MSI y su SHA-256
         shell: pwsh
@@ -56,5 +61,6 @@ jobs:
           $msi = "dist\LCVDesk-$version-x64.msi"
           $notes = "notas.md"
           if (-not (Test-Path $notes)) { "LCVDesk $version" | Set-Content $notes -Encoding utf8 }
-          gh release create "${{ github.ref_name }}" "$msi" "$msi.sha256" `
-            --title "LCVDesk $version" --notes-file $notes
+          $args = @("${{ github.ref_name }}", $msi, "$msi.sha256", '--title', "LCVDesk $version", '--notes-file', $notes)
+          if ($version -match '-') { $args += '--prerelease' }   # beta/rc ⇒ prerelease
+          gh release create @args

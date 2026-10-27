@@ -18,7 +18,12 @@ use tracing::{info, warn};
 const DEFAULT_REPO: &str = "LCV2107/LCVDesk";
 
 pub fn current_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    // En las compilaciones de CI, la versión real viene de la etiqueta (p. ej. 0.2.0-beta.1) vía
+    // LCVDESK_VERSION; así el mismo commit sirve para beta y estable. En local, la de Cargo.
+    match option_env!("LCVDESK_VERSION") {
+        Some(v) if !v.is_empty() => v,
+        _ => env!("CARGO_PKG_VERSION"),
+    }
 }
 
 fn repo() -> String {
@@ -33,6 +38,8 @@ pub struct Release {
     pub msi_url: String,
     pub sha_url: Option<String>,
     pub size: u64,
+    /// La actualización es crítica (las notas incluyen la marca `[critical]`): se obliga a instalar.
+    pub critical: bool,
 }
 
 pub enum Status {
@@ -59,8 +66,8 @@ impl Updater {
         self.status.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Busca una versión nueva en segundo plano (no bloquea la interfaz).
-    pub fn check(&self, ctx: egui::Context) {
+    /// Busca una versión nueva en segundo plano (no bloquea la interfaz). `beta` incluye los prereleases.
+    pub fn check(&self, ctx: egui::Context, beta: bool) {
         if self.busy.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -70,7 +77,7 @@ impl Updater {
         std::thread::Builder::new()
             .name("updater-check".into())
             .spawn(move || {
-                let result = fetch_latest();
+                let result = fetch_latest(beta);
                 *status.lock().unwrap() = match result {
                     Ok(Some(r)) => {
                         info!("versión disponible: {}", r.version);
@@ -132,8 +139,9 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
-/// Consulta las versiones y devuelve la estable más reciente mayor que la actual que traiga un `.msi`.
-fn fetch_latest() -> Result<Option<Release>, String> {
+/// Consulta las versiones y devuelve la más reciente mayor que la actual que traiga un `.msi`.
+/// Con `beta=false` ignora los prereleases; con `beta=true` también los considera.
+fn fetch_latest(beta: bool) -> Result<Option<Release>, String> {
     let url = format!("https://api.github.com/repos/{}/releases?per_page=30", repo());
     let body = agent()
         .get(&url)
@@ -148,7 +156,11 @@ fn fetch_latest() -> Result<Option<Release>, String> {
 
     let mut best: Option<(Ver, Release)> = None;
     for r in releases.as_array().into_iter().flatten() {
-        if r["draft"].as_bool() == Some(true) || r["prerelease"].as_bool() == Some(true) {
+        if r["draft"].as_bool() == Some(true) {
+            continue;
+        }
+        // Los prereleases (betas) solo cuentan en el canal Beta.
+        if r["prerelease"].as_bool() == Some(true) && !beta {
             continue;
         }
         let Some(v) = r["tag_name"].as_str().and_then(parse_version) else { continue };
@@ -169,16 +181,23 @@ fn fetch_latest() -> Result<Option<Release>, String> {
                 sha_url = Some(dl);
             }
         }
+        // Exigir ambos: sin el .sha256 no podríamos verificar la descarga, así que se descarta.
         let Some(msi_url) = msi_url else { continue };
+        let Some(sha_url) = sha_url else { continue };
+        let notes = r["body"].as_str().unwrap_or("").trim().to_string();
+        // Una actualización crítica se marca escribiendo [critical] en las notas de la versión.
+        let low = notes.to_lowercase();
+        let critical = low.contains("[critical]") || low.contains("[critica]") || low.contains("[crítica]");
         best = Some((
             v,
             Release {
                 version: r["tag_name"].as_str().unwrap_or("").trim_start_matches('v').to_string(),
-                notes: r["body"].as_str().unwrap_or("").trim().to_string(),
+                notes,
                 page: r["html_url"].as_str().unwrap_or("").to_string(),
                 msi_url,
-                sha_url,
+                sha_url: Some(sha_url),
                 size,
+                critical,
             },
         ));
     }

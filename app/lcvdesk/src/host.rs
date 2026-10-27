@@ -36,18 +36,26 @@ pub struct HostState {
 #[derive(Clone)]
 pub struct Host {
     state: Arc<Mutex<HostState>>,
+    /// `true` mientras hay una sesión activa (lo lee el descubrimiento para anunciarse ocupado).
+    busy: Arc<AtomicBool>,
 }
 
 impl Host {
     pub fn start(port: u16) -> Self {
         let state = Arc::new(Mutex::new(HostState { port, ..Default::default() }));
-        let s = state.clone();
-        thread::Builder::new().name("host-listen".into()).spawn(move || listen(port, s)).ok();
-        Self { state }
+        let busy = Arc::new(AtomicBool::new(false));
+        let (s, b) = (state.clone(), busy.clone());
+        thread::Builder::new().name("host-listen".into()).spawn(move || listen(port, s, b)).ok();
+        Self { state, busy }
     }
 
     pub fn state(&self) -> MutexGuard<'_, HostState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Indicador compartido de sesión activa, para el anuncio de descubrimiento.
+    pub fn busy_flag(&self) -> Arc<AtomicBool> {
+        self.busy.clone()
     }
 
     /// Corta la sesión activa (botón "Desconectar" del equipo controlado).
@@ -59,7 +67,7 @@ impl Host {
     }
 }
 
-fn listen(port: u16, state: Arc<Mutex<HostState>>) {
+fn listen(port: u16, state: Arc<Mutex<HostState>>, busy: Arc<AtomicBool>) {
     let listener = match TcpListener::bind(("0.0.0.0", port)) {
         Ok(l) => l,
         Err(e) => {
@@ -72,10 +80,11 @@ fn listen(port: u16, state: Arc<Mutex<HostState>>) {
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
         let state = state.clone();
+        let busy = busy.clone();
         thread::Builder::new()
             .name("host-session".into())
             .spawn(move || {
-                if let Err(e) = handle(stream, &state) {
+                if let Err(e) = handle(stream, &state, &busy) {
                     warn!("sesión terminada: {e:#}");
                 }
             })
@@ -83,7 +92,7 @@ fn listen(port: u16, state: Arc<Mutex<HostState>>) {
     }
 }
 
-fn handle(mut stream: TcpStream, state: &Arc<Mutex<HostState>>) -> anyhow::Result<()> {
+fn handle(mut stream: TcpStream, state: &Arc<Mutex<HostState>>, busy: &Arc<AtomicBool>) -> anyhow::Result<()> {
     let peer = stream.peer_addr()?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -101,7 +110,14 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<HostState>>) -> anyhow::Resul
         reject(&mut stream, "El equipo ya tiene una sesión activa");
         bail!("ocupado");
     }
-    if !ask_consent(&name, peer) {
+
+    // Autenticación opcional por contraseña (reto-respuesta HMAC). Si coincide, se entra sin pedir
+    // aceptación manual. Si no hay contraseña, o es incorrecta, se cae al diálogo de aceptación.
+    let authed = verify_password(&mut stream)?;
+    if authed {
+        info!("{name} ({peer}) autenticado por contraseña");
+    }
+    if !authed && !ask_consent(&name, peer) {
         reject(&mut stream, "El usuario rechazó la conexión");
         bail!("rechazada por el usuario");
     }
@@ -116,10 +132,27 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<HostState>>) -> anyhow::Resul
         }
         st.session = Some(SessionInfo { peer, name, stop: stop.clone(), stream: stream.try_clone()? });
     }
+    busy.store(true, Ordering::Relaxed);
     let result = run_session(stream, stop);
+    busy.store(false, Ordering::Relaxed);
     state.lock().unwrap().session = None;
     info!("sesión con {peer} cerrada");
     result
+}
+
+/// Reto-respuesta de contraseña. Devuelve `true` solo si el host tiene contraseña configurada y el
+/// visor respondió con el HMAC correcto. Si no hay contraseña, devuelve `false` (se pedirá aceptar).
+fn verify_password(stream: &mut TcpStream) -> anyhow::Result<bool> {
+    let Some(password) = crate::auth::load_password() else { return Ok(false) };
+    let nonce = crate::auth::random_nonce();
+    write_message(stream, &Message::AuthChallenge { nonce: nonce.clone() })?;
+    // El tiempo de espera de lectura (10 s) ya está activo en este punto.
+    let mac = match read_message(stream)? {
+        Message::AuthResponse { mac } => mac,
+        _ => return Ok(false),
+    };
+    let expected = crate::auth::hmac_sha256(password.as_bytes(), &nonce);
+    Ok(crate::auth::constant_eq(&expected, &mac))
 }
 
 /// Aceptación explícita mínima. La ventana completa (permisos, código de verificación) llega en la Fase 4.4.
@@ -173,7 +206,12 @@ fn run_session(stream: TcpStream, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::sync_channel::<Message>(3);
     let keyframe = Arc::new(AtomicBool::new(false));
     let requested_display = Arc::new(AtomicU32::new(NO_DISPLAY));
-    tx.send(Message::Accepted { displays: displays.iter().map(to_proto).collect(), current: cur.index })?;
+    tx.send(Message::Accepted {
+        host_id: crate::identity::machine_id(),
+        host_name: crate::identity::machine_name(),
+        displays: displays.iter().map(to_proto).collect(),
+        current: cur.index,
+    })?;
     spawn_writer(stream.try_clone()?, rx, stop.clone());
     spawn_reader(
         stream.try_clone()?,
@@ -309,6 +347,8 @@ fn spawn_reader(
     thread::Builder::new()
         .name("host-reader".into())
         .spawn(move || {
+            // El visor envía Ping cada segundo; si no llega nada en 8 s, damos la conexión por muerta.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
             let mut injector = Injector::new(initial_target);
             loop {
                 match read_message(&mut stream) {

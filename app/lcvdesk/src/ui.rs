@@ -1,19 +1,81 @@
 //! Ventana principal: estado del equipo, conexión a otro equipo, vista remota y control.
 
+use crate::discovery::Discovery;
 use crate::host::Host;
+use crate::keyhook;
 use crate::keymap;
+use crate::recents::{self, SavedDevice};
 use crate::uac;
 use crate::updater::{self, Updater};
 use crate::viewer::{Status, Viewer};
 use eframe::egui::{
-    self, Color32, ColorImage, Event, Key, Modifiers, PointerButton, Rect, RichText, Sense,
-    TextureHandle, TextureOptions, pos2,
+    self, Color32, ColorImage, CornerRadius, Event, Frame, Key, Modifiers, PointerButton, Rect,
+    RichText, Sense, Stroke, TextureHandle, TextureOptions, ThemePreference, pos2,
 };
 use eframe::egui_wgpu::SurfaceConfig;
 use lcv_proto::{Message, MouseButton};
 use std::time::Duration;
 
-pub fn run(host: Host) -> anyhow::Result<()> {
+/// Preferencia de tema de la interfaz.
+#[derive(Clone, Copy, PartialEq)]
+enum Theme {
+    System,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "light" => Theme::Light,
+            "dark" => Theme::Dark,
+            _ => Theme::System,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Theme::System => "system",
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
+    fn preference(self) -> ThemePreference {
+        match self {
+            Theme::System => ThemePreference::System,
+            Theme::Light => ThemePreference::Light,
+            Theme::Dark => ThemePreference::Dark,
+        }
+    }
+}
+
+/// Canal de actualizaciones.
+#[derive(Clone, Copy, PartialEq)]
+enum Channel {
+    Stable,
+    Beta,
+}
+
+impl Channel {
+    fn from_str(s: &str) -> Self {
+        if s == "beta" { Channel::Beta } else { Channel::Stable }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Channel::Stable => "stable",
+            Channel::Beta => "beta",
+        }
+    }
+    fn is_beta(self) -> bool {
+        matches!(self, Channel::Beta)
+    }
+}
+
+/// Verde "conectado", gris "desconectado", naranja "ocupado", rojo "controlando".
+const GREEN: Color32 = Color32::from_rgb(46, 170, 90);
+const ORANGE: Color32 = Color32::from_rgb(210, 150, 50);
+const RED: Color32 = Color32::from_rgb(214, 78, 70);
+
+pub fn run(host: Host, discovery: Discovery) -> anyhow::Result<()> {
     let mut options = eframe::NativeOptions::default();
     options.viewport = egui::ViewportBuilder::default()
         .with_title("LCVDesk")
@@ -25,14 +87,25 @@ pub fn run(host: Host) -> anyhow::Result<()> {
         present_mode: eframe::wgpu::PresentMode::AutoVsync,
         desired_maximum_frame_latency: Some(1),
     };
-    eframe::run_native("LCVDesk", options, Box::new(|_cc| Ok(Box::new(App::new(host)))))
+    eframe::run_native("LCVDesk", options, Box::new(|_cc| Ok(Box::new(App::new(host, discovery)))))
         .map_err(|e| anyhow::anyhow!("no se pudo abrir la ventana: {e}"))
 }
 
 struct App {
     host: Host,
+    discovery: Discovery,
+    /// Equipos recientes (se recarga del disco al conectar o al cambiar favoritos).
+    recents: Vec<SavedDevice>,
+    /// Evita guardar el mismo "reciente" varias veces durante una sesión.
+    recorded_recent: bool,
     viewer: Option<Viewer>,
     address: String,
+    /// Contraseña que el visor envía al conectarse (vacía = pedir aceptación manual en el otro equipo).
+    connect_password: String,
+    /// Campo para configurar la contraseña de acceso de ESTE equipo (lado controlado).
+    access_password: String,
+    /// ¿Hay una contraseña de acceso configurada en este equipo?
+    has_access_password: bool,
     texture: Option<TextureHandle>,
     local_name: String,
     local_ip: String,
@@ -47,14 +120,26 @@ struct App {
     last_mouse: Option<(u16, u16)>,
     /// El control remoto está activo (la vista tiene el foco).
     controlling: bool,
+    /// Tema de la interfaz (persistido).
+    theme: Theme,
+    /// Canal de actualizaciones (persistido).
+    channel: Channel,
+    /// El usuario ocultó el aviso de actualización (no crítica) en esta sesión.
+    update_dismissed: bool,
 }
 
 impl App {
-    fn new(host: Host) -> Self {
+    fn new(host: Host, discovery: Discovery) -> Self {
         Self {
             host,
+            discovery,
+            recents: recents::load(),
+            recorded_recent: false,
             viewer: None,
             address: String::new(),
+            connect_password: String::new(),
+            access_password: String::new(),
+            has_access_password: crate::auth::has_password(),
             texture: None,
             local_name: hostname::get().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default(),
             local_ip: local_ip().unwrap_or_else(|| "sin red".into()),
@@ -66,86 +151,373 @@ impl App {
             sent_mods: Modifiers::default(),
             last_mouse: None,
             controlling: false,
+            theme: Theme::from_str(&crate::settings::load_theme()),
+            channel: Channel::from_str(&crate::settings::load_channel()),
+            update_dismissed: false,
         }
     }
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("top").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("LCVDesk").strong().size(16.0));
-                ui.separator();
-                let port = self.host.state().port;
-                ui.label(format!("Este equipo: {}  ·  {}:{port}", self.local_name, self.local_ip));
-            });
-            let mut disconnect_host = false;
-            {
-                let st = self.host.state();
-                if let Some(err) = &st.listen_error {
-                    ui.colored_label(Color32::RED, format!("No se puede recibir conexiones: {err}"));
-                }
-                if let Some(s) = &st.session {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(
-                            Color32::from_rgb(220, 60, 60),
-                            format!("● «{}» ({}) está viendo y controlando este equipo", s.name, s.peer.ip()),
-                        );
-                        disconnect_host = ui.button("Desconectar").clicked();
-                    });
-                }
+    /// Devuelve la versión nueva encontrada (si la hay), para avisos y actualización obligatoria.
+    fn found_release(&self) -> Option<updater::Release> {
+        match &*self.updater.status() {
+            updater::Status::Found(r) => Some(r.clone()),
+            _ => None,
+        }
+    }
+
+    /// Aplica el tema elegido y el acento azul, en claro u oscuro con el mismo diseño.
+    fn apply_theme(&self, ctx: &egui::Context) {
+        ctx.set_theme(self.theme.preference());
+        // El mismo acento y redondeos en claro y oscuro (comparten diseño).
+        ctx.style_mut_of(egui::Theme::Dark, |s| tune_style(s, true));
+        ctx.style_mut_of(egui::Theme::Light, |s| tune_style(s, false));
+    }
+
+    fn accent(ui: &egui::Ui) -> Color32 {
+        if ui.visuals().dark_mode { Color32::from_rgb(74, 144, 246) } else { Color32::from_rgb(26, 108, 224) }
+    }
+
+    /// Franja superior: solo aparece si hay un aviso (error de escucha, alguien controlándote o
+    /// una actualización obligatoria pendiente mientras hay sesión).
+    fn status_strip(&mut self, ui: &mut egui::Ui) {
+        let (listen_error, session) = {
+            let st = self.host.state();
+            (st.listen_error.clone(), st.session.as_ref().map(|s| (s.name.clone(), s.peer.ip())))
+        };
+        let critical_in_session = self.viewer.is_some() && self.found_release().is_some_and(|r| r.critical);
+        if listen_error.is_none() && session.is_none() && !critical_in_session {
+            return;
+        }
+        egui::Panel::top("status").show(ui, |ui| {
+            ui.add_space(4.0);
+            if let Some(err) = &listen_error {
+                ui.colored_label(RED, format!("⚠ No se pueden recibir conexiones: {err}"));
             }
-            if disconnect_host {
-                self.host.disconnect();
+            if let Some((name, ip)) = &session {
+                ui.horizontal(|ui| {
+                    ui.colored_label(RED, "●");
+                    ui.label(format!("«{name}» ({ip}) está viendo y controlando este equipo"));
+                    if ui.button("Desconectar").clicked() {
+                        self.host.disconnect();
+                    }
+                });
             }
+            if critical_in_session {
+                ui.colored_label(RED, "⚠ Actualización obligatoria disponible: se aplicará al cerrar la sesión.");
+            }
+            ui.add_space(4.0);
         });
     }
 
-    fn home(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(20.0);
-        ui.heading("Conectarse a otro equipo");
+    /// Barra lateral: identidad de este equipo y ajustes.
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.label("Escribe la IP o el nombre del equipo (debe tener LCVDesk abierto).");
+        ui.label(RichText::new("LCVDesk").strong().size(22.0).color(Self::accent(ui)));
+        ui.label(RichText::new(format!("v{}", updater::current_version())).small().color(Color32::GRAY));
+        ui.add_space(14.0);
+
+        ui.label(RichText::new("ESTE EQUIPO").small().strong().color(Color32::GRAY));
+        ui.add_space(4.0);
+        let port = self.host.state().port;
+        Frame::group(ui.style()).corner_radius(10).inner_margin(12).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(&self.local_name).strong().size(16.0));
+            ui.add_space(2.0);
+            ui.label(RichText::new(format!("{}:{port}", self.local_ip)).monospace());
+            ui.add_space(8.0);
+            let mut visible = self.discovery.is_discoverable();
+            if ui.checkbox(&mut visible, "Visible en la red").changed() {
+                self.discovery.set_discoverable(visible);
+            }
+        });
+
+        ui.add_space(14.0);
+        egui::CollapsingHeader::new(RichText::new("⚙  Ajustes").strong()).default_open(false).show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.label(RichText::new("Tema").small().strong().color(Color32::GRAY));
+            ui.horizontal(|ui| {
+                for (label, t) in [("Sistema", Theme::System), ("Claro", Theme::Light), ("Oscuro", Theme::Dark)] {
+                    if ui.selectable_label(self.theme == t, label).clicked() {
+                        self.theme = t;
+                        crate::settings::save_theme(t.as_str());
+                    }
+                }
+            });
+            ui.add_space(10.0);
+
+            ui.label(RichText::new("Canal de actualizaciones").small().strong().color(Color32::GRAY));
+            ui.horizontal(|ui| {
+                for (label, c) in [("Estable", Channel::Stable), ("Beta", Channel::Beta)] {
+                    if ui.selectable_label(self.channel == c, label).clicked() && self.channel != c {
+                        self.channel = c;
+                        crate::settings::save_channel(c.as_str());
+                        self.update_dismissed = false;
+                        self.updater.check(ui.ctx().clone(), self.channel.is_beta());
+                    }
+                }
+            });
+            if self.channel.is_beta() {
+                ui.label(
+                    RichText::new("Recibes versiones de prueba antes que el resto. Pueden ser inestables.")
+                        .small()
+                        .color(ORANGE),
+                );
+            }
+            ui.add_space(10.0);
+            self.access_password_section(ui);
+            ui.add_space(10.0);
+            self.uac_section(ui);
+            ui.add_space(10.0);
+            self.updates_section(ui);
+        });
+    }
+
+    /// Área principal cuando no hay sesión: barra de conexión y tarjetas de equipos.
+    fn main_area(&mut self, ui: &mut egui::Ui) {
+        self.update_banner(ui);
+        ui.add_space(16.0);
+        ui.heading("Conectar a un equipo");
         ui.add_space(8.0);
         let mut connect = false;
         ui.horizontal(|ui| {
             let edit = ui.add(
-                egui::TextEdit::singleline(&mut self.address).hint_text("192.168.0.20 o PC-TALLER").desired_width(260.0),
+                egui::TextEdit::singleline(&mut self.address)
+                    .hint_text("IP o nombre del equipo")
+                    .desired_width(300.0),
             );
             connect |= edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            connect |= ui.button("Conectar").clicked();
+            if ui.add(egui::Button::new(RichText::new("Conectar").strong())).clicked() {
+                connect = true;
+            }
         });
-        if connect && !self.address.trim().is_empty() {
-            self.texture = None;
-            self.last_close_reason = None;
-            self.controlling = false;
-            self.viewer = Some(Viewer::connect(self.address.trim().to_string(), ui.ctx().clone()));
+        ui.horizontal(|ui| {
+            let pw = ui.add(
+                egui::TextEdit::singleline(&mut self.connect_password)
+                    .password(true)
+                    .hint_text("contraseña (si la piden)")
+                    .desired_width(300.0),
+            );
+            connect |= pw.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        });
+        if connect {
+            let addr = self.address.clone();
+            self.start_connect(addr, ui.ctx());
         }
         if let Some(reason) = &self.last_close_reason {
-            ui.add_space(8.0);
-            ui.colored_label(Color32::from_rgb(230, 160, 40), reason);
+            ui.add_space(6.0);
+            ui.colored_label(ORANGE, reason);
         }
 
-        ui.add_space(28.0);
-        ui.separator();
-        ui.add_space(8.0);
-        self.updates_section(ui);
-
         ui.add_space(20.0);
-        ui.separator();
-        ui.add_space(8.0);
-        self.uac_section(ui);
+        self.devices_section(ui);
+    }
+
+    /// Aviso discreto (no crítico) de actualización disponible, en la parte superior.
+    fn update_banner(&mut self, ui: &mut egui::Ui) {
+        if self.update_dismissed {
+            return;
+        }
+        let Some(r) = self.found_release() else { return };
+        if r.critical {
+            return; // la crítica usa la pantalla obligatoria
+        }
+        let accent = Self::accent(ui);
+        let tint = accent.gamma_multiply(if ui.visuals().dark_mode { 0.22 } else { 0.12 });
+        ui.add_space(10.0);
+        Frame::group(ui.style()).fill(tint).stroke(Stroke::new(1.0, accent)).corner_radius(10).inner_margin(10).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.colored_label(accent, "●");
+                ui.label(RichText::new(format!("Actualización disponible: {}", r.version)).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Ahora no").clicked() {
+                        self.update_dismissed = true;
+                    }
+                    if ui.button(RichText::new("Instalar").strong()).clicked() {
+                        self.updater.install(r.clone(), ui.ctx().clone());
+                    }
+                });
+            });
+        });
+    }
+
+    /// Pantalla a pantalla completa para una actualización crítica: solo se puede actualizar o salir.
+    fn mandatory_update(&mut self, ui: &mut egui::Ui, r: updater::Release) {
+        use updater::Status;
+        // Instantánea del estado para no mantener bloqueado el mutex mientras se dibuja.
+        let phase = match &*self.updater.status() {
+            Status::Downloading(p) => Status::Downloading(*p),
+            Status::Installing => Status::Installing,
+            Status::Error(e) => Status::Error(e.clone()),
+            _ => Status::Idle,
+        };
+        ui.add_space(48.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("⚠ Actualización obligatoria").size(26.0).strong().color(RED));
+            ui.add_space(8.0);
+            ui.label("Esta versión incluye un cambio crítico. Debes actualizar para seguir usando LCVDesk.");
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("Nueva versión: {}", r.version)).strong());
+            if !r.notes.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(truncate(&r.notes, 300)).small().color(Color32::GRAY));
+            }
+            ui.add_space(18.0);
+            match phase {
+                Status::Downloading(pct) => {
+                    ui.add(egui::ProgressBar::new(pct as f32 / 100.0).show_percentage().desired_width(280.0));
+                    ui.label(RichText::new("Descargando y verificando…").small().color(Color32::GRAY));
+                }
+                Status::Installing => {
+                    ui.spinner();
+                    ui.label("Instalando… LCVDesk se cerrará para aplicar la actualización.");
+                }
+                _ => {
+                    if let Status::Error(e) = &phase {
+                        ui.colored_label(RED, format!("No se pudo actualizar: {e}"));
+                        ui.add_space(6.0);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("Descargar e instalar").strong()).clicked() {
+                            self.updater.install(r.clone(), ui.ctx().clone());
+                        }
+                        if ui.button("Salir").clicked() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    /// Inicia una conexión hacia `addr` con la contraseña actual del formulario.
+    fn start_connect(&mut self, addr: String, ctx: &egui::Context) {
+        if addr.trim().is_empty() {
+            return;
+        }
+        self.texture = None;
+        self.last_close_reason = None;
+        self.controlling = false;
+        self.recorded_recent = false;
+        self.viewer = Some(Viewer::connect(addr.trim().to_string(), self.connect_password.clone(), ctx.clone()));
+    }
+
+    /// Tarjetas de equipos encontrados en la red y de equipos recientes.
+    fn devices_section(&mut self, ui: &mut egui::Ui) {
+        let found = self.discovery.list();
+
+        section_header(ui, "En la red");
+        ui.add_space(6.0);
+        if found.is_empty() {
+            ui.label(RichText::new("Buscando equipos con LCVDesk en tu red…").small().color(Color32::GRAY));
+        } else {
+            let mut connect_addr = None;
+            ui.horizontal_wrapped(|ui| {
+                for f in &found {
+                    let act = device_card(ui, &f.name, &f.addr, true, f.busy, None);
+                    if act.connect {
+                        connect_addr = Some(f.addr.clone());
+                    }
+                }
+            });
+            if let Some(a) = connect_addr {
+                self.start_connect(a, ui.ctx());
+            }
+        }
+
+        ui.add_space(18.0);
+        section_header(ui, "Recientes");
+        ui.add_space(6.0);
+        if self.recents.is_empty() {
+            ui.label(RichText::new("Aún no te has conectado a ningún equipo.").small().color(Color32::GRAY));
+            return;
+        }
+        let online: std::collections::HashSet<&str> = found.iter().map(|f| f.id.as_str()).collect();
+        let (mut connect_addr, mut remove_id, mut fav_toggle) = (None, None, None);
+        ui.horizontal_wrapped(|ui| {
+            for d in &self.recents {
+                let on = online.contains(d.id.as_str());
+                let act = device_card(ui, &d.name, &d.addr, on, false, Some(d.favorite));
+                if act.connect {
+                    connect_addr = Some(d.addr.clone());
+                }
+                if act.favorite {
+                    fav_toggle = Some((d.id.clone(), !d.favorite));
+                }
+                if act.remove {
+                    remove_id = Some(d.id.clone());
+                }
+            }
+        });
+        if let Some((id, fav)) = fav_toggle {
+            recents::set_favorite(&id, fav);
+            self.recents = recents::load();
+        }
+        if let Some(id) = remove_id {
+            recents::remove(&id);
+            self.recents = recents::load();
+        }
+        if let Some(a) = connect_addr {
+            self.start_connect(a, ui.ctx());
+        }
+    }
+
+    /// Configura la contraseña de acceso de ESTE equipo (lado controlado). Con contraseña, quien la
+    /// sepa entra sin que haya que aceptar manualmente; sin ella (o si falla) se pide aceptación.
+    fn access_password_section(&mut self, ui: &mut egui::Ui) {
+        section_header(ui, "Acceso por contraseña");
+        ui.add_space(4.0);
+        if self.has_access_password {
+            ui.horizontal(|ui| {
+                ui.colored_label(Color32::from_rgb(40, 160, 70), "● Hay una contraseña configurada.");
+                if ui.button("Quitar contraseña").clicked() {
+                    crate::auth::clear_password();
+                    self.has_access_password = crate::auth::has_password();
+                    self.access_password.clear();
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "Quien conozca la contraseña podrá conectarse sin que tengas que aceptar. \
+                     Si no la introduce o es incorrecta, aún aparecerá la ventana para aceptar.",
+                )
+                .small()
+                .color(Color32::GRAY),
+            );
+        } else {
+            ui.label(
+                RichText::new(
+                    "Sin contraseña, cada conexión te pide aceptar manualmente. Define una para \
+                     permitir el acceso sin confirmación en este equipo.",
+                )
+                .small()
+                .color(Color32::GRAY),
+            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.access_password)
+                        .password(true)
+                        .hint_text("nueva contraseña")
+                        .desired_width(180.0),
+                );
+                let can_save = !self.access_password.trim().is_empty();
+                if ui.add_enabled(can_save, egui::Button::new("Guardar")).clicked() {
+                    if crate::auth::save_password(&self.access_password) {
+                        self.access_password.clear();
+                        self.has_access_password = crate::auth::has_password();
+                    }
+                }
+            });
+        }
     }
 
     fn updates_section(&mut self, ui: &mut egui::Ui) {
         use updater::Status;
-        ui.horizontal(|ui| {
-            ui.heading("Actualizaciones");
-            ui.label(RichText::new(format!("· versión instalada {}", updater::current_version())).color(Color32::GRAY));
-        });
+        section_header(ui, "Actualizaciones");
         ui.add_space(4.0);
         let busy = matches!(&*self.updater.status(), Status::Checking | Status::Downloading(_) | Status::Installing);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(!busy, egui::Button::new("Buscar actualizaciones")).clicked() {
-                self.updater.check(ui.ctx().clone());
+                self.updater.check(ui.ctx().clone(), self.channel.is_beta());
             }
             // El botón de instalar solo aparece si hay una versión encontrada.
             let found = matches!(&*self.updater.status(), Status::Found(_));
@@ -178,7 +550,7 @@ impl App {
                 }
             }
             Status::Downloading(pct) => {
-                ui.add(egui::ProgressBar::new(*pct as f32 / 100.0).show_percentage().desired_width(360.0));
+                ui.add(egui::ProgressBar::new(*pct as f32 / 100.0).show_percentage());
                 ui.label(RichText::new("Descargando y verificando…").small().color(Color32::GRAY));
             }
             Status::Installing => {
@@ -194,7 +566,7 @@ impl App {
     }
 
     fn uac_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Permitir ventanas de administrador (UAC) en remoto");
+        section_header(ui, "UAC en remoto");
         ui.add_space(4.0);
         match self.uac_enabled {
             None => {
@@ -229,7 +601,8 @@ impl App {
 
     fn remote(&mut self, ui: &mut egui::Ui) {
         let Some(viewer) = self.viewer.as_ref() else { return };
-        let (status_text, stats, frame, closed, displays, current) = {
+        let target = viewer.target.clone();
+        let (status_text, stats, frame, closed, displays, current, host_id, host_name) = {
             let mut sh = viewer.shared();
             let text = match &sh.status {
                 Status::Connecting => Some(format!("Conectando con {}…", viewer.target)),
@@ -238,14 +611,22 @@ impl App {
                 Status::Closed(r) => Some(r.clone()),
             };
             let closed = matches!(sh.status, Status::Closed(_));
-            (text, sh.stats, sh.frame.take(), closed, sh.displays.clone(), sh.current_display)
+            (text, sh.stats, sh.frame.take(), closed, sh.displays.clone(), sh.current_display, sh.host_id.clone(), sh.host_name.clone())
         };
 
         if closed {
             self.last_close_reason = status_text;
             self.viewer = None;
             self.controlling = false;
+            keyhook::set_grab(false);
             return;
+        }
+
+        // Al confirmarse la sesión, guardar (una vez) el equipo en "Recientes".
+        if status_text.is_none() && !self.recorded_recent && !host_id.is_empty() {
+            recents::record(&host_id, &host_name, &target);
+            self.recents = recents::load();
+            self.recorded_recent = true;
         }
 
         if let Some(f) = frame {
@@ -316,6 +697,8 @@ impl App {
         let response = ui.allocate_rect(area, Sense::click_and_drag());
         if status_text.is_none() {
             self.handle_control(ui, &response, image_rect);
+        } else {
+            keyhook::set_grab(false);
         }
     }
 
@@ -341,8 +724,14 @@ impl App {
                 self.sent_mods = Modifiers::default();
                 self.controlling = false;
             }
+            keyhook::set_grab(false);
             return;
         }
+
+        // Con el hook instalado, el teclado (incluida la tecla Windows, Alt+Tab, etc.) se captura a
+        // bajo nivel y se reenvía como scancodes; no usamos los eventos de teclado de egui.
+        let use_hook = keyhook::installed();
+        keyhook::set_grab(use_hook);
 
         // --- Ratón: posición normalizada 0..=65535 sobre la imagen remota. ---
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
@@ -358,9 +747,9 @@ impl App {
 
         // --- Eventos (botones, rueda, teclado). ---
         let (events, mods) = ui.input(|i| (i.events.clone(), i.modifiers));
-        // Modificadores: enviar los cambios de Ctrl/Shift/Alt/Win como pulsaciones de tecla.
-        // Se escribe en self.sent_mods mientras `viewer` sigue prestado: son campos distintos.
-        {
+        // Modificadores (solo en el respaldo sin hook): enviar los cambios de Ctrl/Shift/Alt como
+        // pulsaciones de tecla. Se escribe en self.sent_mods mientras `viewer` sigue prestado.
+        if !use_hook {
             let prev = self.sent_mods;
             let send_mod = |vk: u16, down: bool| {
                 if let Some((sc, ext)) = keymap::vk_to_scancode(vk) {
@@ -375,9 +764,6 @@ impl App {
             }
             if mods.alt != prev.alt {
                 send_mod(keymap::VK_MENU, mods.alt);
-            }
-            if mods.command != prev.command {
-                send_mod(keymap::VK_LWIN, mods.command);
             }
             self.sent_mods = mods;
         }
@@ -396,12 +782,13 @@ impl App {
                         viewer.send(&Message::MouseWheel { dx, dy });
                     }
                 }
-                Event::Text(text) if !mods.ctrl && !mods.alt && !mods.command => {
+                // El teclado con hook se reenvía por scancode desde keyhook; aquí solo el respaldo.
+                Event::Text(text) if !use_hook && !mods.ctrl && !mods.alt && !mods.command => {
                     for ch in text.chars() {
                         viewer.send(&Message::Unicode { ch: ch as u32 });
                     }
                 }
-                Event::Key { key, pressed, .. } => {
+                Event::Key { key, pressed, .. } if !use_hook => {
                     // El texto imprimible sin modificadores ya se envía como Unicode; evita duplicar.
                     let is_shortcut = mods.ctrl || mods.alt || mods.command;
                     if keymap::is_text_key(*key) && !is_shortcut {
@@ -417,22 +804,104 @@ impl App {
             }
         }
     }
-
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx().request_repaint_after(Duration::from_millis(500));
+        self.apply_theme(ui.ctx());
         // Comprobación automática de actualizaciones, una vez al arrancar.
         if !self.update_checked {
             self.update_checked = true;
-            self.updater.check(ui.ctx().clone());
+            self.updater.check(ui.ctx().clone(), self.channel.is_beta());
         }
-        self.top_bar(ui);
-        egui::CentralPanel::default().show(ui, |ui| {
-            if self.viewer.is_some() { self.remote(ui) } else { self.home(ui) }
-        });
+        let critical = self.found_release().filter(|r| r.critical);
+        self.status_strip(ui);
+        // Actualización crítica: se obliga a instalar (fuera de una sesión activa, para no cortarla).
+        if self.viewer.is_none() {
+            if let Some(r) = critical {
+                egui::CentralPanel::default().show(ui, |ui| self.mandatory_update(ui, r));
+                return;
+            }
+        }
+        if self.viewer.is_some() {
+            egui::CentralPanel::default().show(ui, |ui| self.remote(ui));
+        } else {
+            egui::Panel::left("side").resizable(false).show(ui, |ui| {
+                ui.set_min_width(248.0);
+                egui::ScrollArea::vertical().show(ui, |ui| self.sidebar(ui));
+            });
+            egui::CentralPanel::default().show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.main_area(ui));
+            });
+        }
     }
+}
+
+/// Ajusta un estilo (acento azul y redondeos) para el tema claro u oscuro.
+fn tune_style(s: &mut egui::Style, dark: bool) {
+    let accent = if dark { Color32::from_rgb(74, 144, 246) } else { Color32::from_rgb(26, 108, 224) };
+    s.visuals.selection.bg_fill = accent.gamma_multiply(if dark { 0.45 } else { 0.30 });
+    s.visuals.selection.stroke = Stroke::new(1.0, accent);
+    s.visuals.hyperlink_color = accent;
+    s.visuals.widgets.hovered.weak_bg_fill = accent.gamma_multiply(if dark { 0.30 } else { 0.18 });
+    s.visuals.widgets.active.weak_bg_fill = accent;
+    s.visuals.widgets.active.bg_fill = accent;
+    let cr = CornerRadius::same(7);
+    s.visuals.widgets.noninteractive.corner_radius = cr;
+    s.visuals.widgets.inactive.corner_radius = cr;
+    s.visuals.widgets.hovered.corner_radius = cr;
+    s.visuals.widgets.active.corner_radius = cr;
+    s.visuals.widgets.open.corner_radius = cr;
+    s.visuals.window_corner_radius = CornerRadius::same(10);
+    s.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    s.spacing.button_padding = egui::vec2(12.0, 7.0);
+}
+
+fn section_header(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text.to_uppercase()).small().strong().color(Color32::GRAY));
+}
+
+#[derive(Default)]
+struct CardActions {
+    connect: bool,
+    favorite: bool,
+    remove: bool,
+}
+
+/// Dibuja una tarjeta de equipo y devuelve qué botones se pulsaron.
+/// `favorite` es `None` para equipos de la red (sin estrella/quitar) o `Some(fav)` para recientes.
+fn device_card(ui: &mut egui::Ui, name: &str, addr: &str, online: bool, busy: bool, favorite: Option<bool>) -> CardActions {
+    let mut act = CardActions::default();
+    Frame::group(ui.style()).corner_radius(10).inner_margin(12).show(ui, |ui| {
+        ui.set_width(168.0);
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("🖥").size(22.0));
+                ui.add_space(2.0);
+                ui.colored_label(if online { GREEN } else { Color32::from_gray(110) }, "●");
+                if busy {
+                    ui.label(RichText::new("ocupado").small().color(ORANGE));
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(RichText::new(truncate(name, 22)).strong().size(15.0));
+            ui.label(RichText::new(addr).small().color(Color32::GRAY));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                act.connect = ui.button(RichText::new("Conectar").strong()).clicked();
+                if let Some(fav) = favorite {
+                    if ui.button(if fav { "★" } else { "☆" }).on_hover_text("Favorito").clicked() {
+                        act.favorite = true;
+                    }
+                    if ui.button("✕").on_hover_text("Quitar de recientes").clicked() {
+                        act.remove = true;
+                    }
+                }
+            });
+        });
+    });
+    act
 }
 
 fn display_label(d: &lcv_proto::DisplayInfo) -> String {
@@ -445,7 +914,8 @@ fn map_button(b: PointerButton) -> Option<MouseButton> {
         PointerButton::Primary => Some(MouseButton::Left),
         PointerButton::Secondary => Some(MouseButton::Right),
         PointerButton::Middle => Some(MouseButton::Middle),
-        _ => None,
+        PointerButton::Extra1 => Some(MouseButton::Back),
+        PointerButton::Extra2 => Some(MouseButton::Forward),
     }
 }
 

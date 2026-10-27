@@ -14,6 +14,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Marca de origen de los eventos sintéticos de LCVDesk.
 pub const EXTRA_INFO: usize = 0x1C_7D_E5_00;
 
+/// Valores de `mouseData` para los botones laterales del ratón (ver WinUser.h).
+const XBUTTON1: i32 = 0x0001;
+const XBUTTON2: i32 = 0x0002;
+
 /// Rectángulo del monitor que se está controlando, en píxeles del escritorio virtual.
 #[derive(Clone, Copy)]
 pub struct TargetRect {
@@ -75,6 +79,11 @@ impl Injector {
             (MouseButton::Right, false) => (MOUSEEVENTF_RIGHTUP, 0),
             (MouseButton::Middle, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
             (MouseButton::Middle, false) => (MOUSEEVENTF_MIDDLEUP, 0),
+            // Los botones laterales usan XBUTTON1/XBUTTON2 en mouseData.
+            (MouseButton::Back, true) => (MOUSEEVENTF_XDOWN, XBUTTON1),
+            (MouseButton::Back, false) => (MOUSEEVENTF_XUP, XBUTTON1),
+            (MouseButton::Forward, true) => (MOUSEEVENTF_XDOWN, XBUTTON2),
+            (MouseButton::Forward, false) => (MOUSEEVENTF_XUP, XBUTTON2),
         };
         if down {
             self.buttons_down.insert(button as u8);
@@ -119,12 +128,14 @@ impl Injector {
             send_key_scancode(key & 0x7FFF, key & 0x8000 != 0, false);
         }
         for button in std::mem::take(&mut self.buttons_down) {
-            let flag = match button {
-                b if b == MouseButton::Left as u8 => MOUSEEVENTF_LEFTUP,
-                b if b == MouseButton::Right as u8 => MOUSEEVENTF_RIGHTUP,
-                _ => MOUSEEVENTF_MIDDLEUP,
+            let (flag, data) = match button {
+                b if b == MouseButton::Left as u8 => (MOUSEEVENTF_LEFTUP, 0),
+                b if b == MouseButton::Right as u8 => (MOUSEEVENTF_RIGHTUP, 0),
+                b if b == MouseButton::Middle as u8 => (MOUSEEVENTF_MIDDLEUP, 0),
+                b if b == MouseButton::Back as u8 => (MOUSEEVENTF_XUP, XBUTTON1),
+                _ => (MOUSEEVENTF_XUP, XBUTTON2),
             };
-            send_mouse(flag, 0, 0, 0);
+            send_mouse(flag, 0, 0, data);
         }
     }
 }

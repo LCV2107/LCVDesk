@@ -35,6 +35,13 @@
           <fw:FirewallException Id="FwLcvdeskTcpPrivate" Name="LCVDesk (TCP 47070)"
                                 Description="Conexiones de escritorio remoto LCVDesk en la red de la oficina"
                                 Protocol="tcp" Port="47070" Scope="any" Profile="private" />
+          <!-- Descubrimiento de equipos en la red local (UDP multicast 239.255.47.71:47071). -->
+          <fw:FirewallException Id="FwLcvdeskUdp" Name="LCVDesk (descubrimiento UDP 47071)"
+                                Description="Descubrimiento de equipos LCVDesk en la red de la oficina"
+                                Protocol="udp" Port="47071" Scope="any" Profile="domain" />
+          <fw:FirewallException Id="FwLcvdeskUdpPrivate" Name="LCVDesk (descubrimiento UDP 47071)"
+                                Description="Descubrimiento de equipos LCVDesk en la red de la oficina"
+                                Protocol="udp" Port="47071" Scope="any" Profile="private" />
         </File>
       </Component>
       <Component Id="License">

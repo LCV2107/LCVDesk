@@ -10,7 +10,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC_EX, MapVirtual
 pub const VK_SHIFT: u16 = 0x10;
 pub const VK_CONTROL: u16 = 0x11;
 pub const VK_MENU: u16 = 0x12; // Alt
-pub const VK_LWIN: u16 = 0x5B;
 
 /// Convierte un VK en (scancode, ¿tecla extendida?). Las teclas extendidas (flechas, Inicio, etc.)
 /// vienen marcadas en el byte alto que devuelve `MapVirtualKeyW` con `MAPVK_VK_TO_VSC_EX`.

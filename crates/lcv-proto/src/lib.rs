@@ -5,8 +5,16 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_PORT: u16 = 47070;
+
+/// Descubrimiento en LAN: grupo multicast y puerto reservados para LCVDesk.
+pub const DISCOVERY_ADDR: [u8; 4] = [239, 255, 47, 71];
+pub const DISCOVERY_PORT: u16 = 47071;
+/// Marca al inicio del datagrama de descubrimiento ("LCVD") para ignorar tráfico ajeno.
+const DISCOVERY_MAGIC: u32 = 0x4C_43_56_44;
+/// Versión del formato de descubrimiento, independiente de `PROTOCOL_VERSION`.
+const DISCOVERY_VERSION: u8 = 1;
 
 /// Límite de seguridad para una trama (un fotograma 4K intra cabe holgadamente).
 const MAX_MESSAGE_LEN: usize = 32 * 1024 * 1024;
@@ -15,8 +23,14 @@ const MAX_MESSAGE_LEN: usize = 32 * 1024 * 1024;
 pub enum Message {
     /// Visor → host: primer mensaje de la conexión.
     Hello { version: u32, name: String },
-    /// Host → visor: el usuario aceptó. Lista de monitores y cuál se transmite al principio.
-    Accepted { displays: Vec<DisplayInfo>, current: u32 },
+    /// Host → visor: el host tiene contraseña configurada. El visor responde `AuthResponse`
+    /// con `HMAC-SHA256(contraseña, nonce)`. La contraseña nunca viaja por la red.
+    AuthChallenge { nonce: Vec<u8> },
+    /// Visor → host: respuesta al reto de contraseña.
+    AuthResponse { mac: Vec<u8> },
+    /// Host → visor: el usuario aceptó. Incluye la identidad del host (para guardarlo en "Recientes"),
+    /// la lista de monitores y cuál se transmite al principio.
+    Accepted { host_id: String, host_name: String, displays: Vec<DisplayInfo>, current: u32 },
     /// Host → visor: conexión rechazada.
     Rejected { reason: String },
     /// Medición de latencia de ida y vuelta: el receptor responde `Pong` con el mismo valor.
@@ -48,6 +62,10 @@ pub enum MouseButton {
     Left,
     Right,
     Middle,
+    /// Botón lateral «atrás» (X1).
+    Back,
+    /// Botón lateral «adelante» (X2).
+    Forward,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -100,6 +118,48 @@ fn invalid_data<E: std::error::Error + Send + Sync + 'static>(e: E) -> io::Error
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
+// --- Descubrimiento en LAN (UDP multicast) ---
+
+/// Datos que un equipo anuncia en la red para que otros lo encuentren. No contiene nada sensible.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Beacon {
+    /// Identificador estable del equipo (no cambia aunque cambie la IP).
+    pub id: String,
+    pub name: String,
+    /// Puerto TCP donde atiende conexiones.
+    pub port: u16,
+    pub version: String,
+    /// `true` si ya tiene una sesión activa (ocupado).
+    pub busy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DiscoveryPacket {
+    /// "Estoy aquí" (se emite periódicamente y como respuesta a `Query`).
+    Announce(Beacon),
+    /// "¿Quién hay?" (al arrancar, para no esperar al siguiente anuncio).
+    Query,
+}
+
+/// Serializa un paquete de descubrimiento con su marca y versión al frente.
+pub fn encode_discovery(packet: &DiscoveryPacket) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(96);
+    buf.extend_from_slice(&DISCOVERY_MAGIC.to_le_bytes());
+    buf.push(DISCOVERY_VERSION);
+    postcard::to_extend(packet, buf).unwrap_or_default()
+}
+
+/// Decodifica un datagrama de descubrimiento; `None` si no es nuestro o está corrupto.
+pub fn decode_discovery(data: &[u8]) -> Option<DiscoveryPacket> {
+    if data.len() < 5 {
+        return None;
+    }
+    if u32::from_le_bytes([data[0], data[1], data[2], data[3]]) != DISCOVERY_MAGIC || data[4] != DISCOVERY_VERSION {
+        return None;
+    }
+    postcard::from_bytes(&data[5..]).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +172,8 @@ mod tests {
             Message::MouseMove { x: 32768, y: 100 },
             Message::Key { scancode: 0x1c, extended: false, down: true },
             Message::Accepted {
+                host_id: "ab12cd34".into(),
+                host_name: "PC-TALLER".into(),
                 displays: vec![DisplayInfo {
                     index: 0,
                     name: "\\\\.\\DISPLAY1".into(),
@@ -140,6 +202,16 @@ mod tests {
         for m in &msgs {
             assert_eq!(&read_message(&mut cursor).unwrap(), m);
         }
+    }
+
+    #[test]
+    fn discovery_roundtrip() {
+        let beacon = Beacon { id: "ab12".into(), name: "PC-TALLER".into(), port: 47070, version: "0.2.0".into(), busy: false };
+        let pkt = DiscoveryPacket::Announce(beacon);
+        assert_eq!(decode_discovery(&encode_discovery(&pkt)), Some(pkt));
+        assert_eq!(decode_discovery(&encode_discovery(&DiscoveryPacket::Query)), Some(DiscoveryPacket::Query));
+        // Un datagrama ajeno (sin nuestra marca) se ignora.
+        assert_eq!(decode_discovery(b"basura cualquiera"), None);
     }
 
     #[test]
