@@ -1,0 +1,20 @@
+[workspace]
+members = ["crates/*", "app/lcvdesk"]
+resolver = "3"
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+authors = ["LCVDesk"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
+
+# El códec por software necesita optimización incluso en debug para ser usable
+[profile.dev.package."*"]
+opt-level = 3

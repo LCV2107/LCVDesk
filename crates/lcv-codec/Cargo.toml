@@ -1,0 +1,15 @@
+[package]
+name = "lcv-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+openh264 = "0.9.9"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+yuv = "0.8.19"
+
+[dev-dependencies]
+lcv-capture = { path = "../lcv-capture" }
+lcv-proto = { path = "../lcv-proto" }

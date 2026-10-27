@@ -1,0 +1,49 @@
+<!--
+  Instalador MSI de LCVDesk (WiX Toolset 5).
+  Se genera con tools\build-msi.ps1; las variables Version y BinDir llegan desde ese script.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
+  <Package Name="LCVDesk"
+           Manufacturer="LCVDesk"
+           Version="$(Version)"
+           UpgradeCode="934321C7-3C9D-40DE-B5CF-742C669601B6"
+           Scope="perMachine">
+    <!-- Reinstalar la misma versión también actualiza (útil durante las pruebas). -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="Ya hay instalada una versión más reciente de LCVDesk." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPURLINFOABOUT" Value="Uso interno - AGPL-3.0" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="LCVDesk" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Main" Directory="INSTALLFOLDER">
+      <Component Id="LcvdeskExe">
+        <File Id="LcvdeskExe" Source="$(BinDir)\lcvdesk.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="LCVDesk"
+                    Description="Escritorio remoto en la red local" WorkingDirectory="INSTALLFOLDER" />
+          <!-- Conexiones entrantes del visor. Se permite en los perfiles Privado y de Dominio
+               (redes de la oficina, aunque haya varias subredes), no en redes públicas.
+               Para restringirlo a rangos concretos, usar tools\firewall.ps1 tras instalar. -->
+          <fw:FirewallException Id="FwLcvdeskTcp" Name="LCVDesk (TCP 47070)"
+                                Description="Conexiones de escritorio remoto LCVDesk en la red de la oficina"
+                                Protocol="tcp" Port="47070" Scope="any" Profile="domain" />
+          <fw:FirewallException Id="FwLcvdeskTcpPrivate" Name="LCVDesk (TCP 47070)"
+                                Description="Conexiones de escritorio remoto LCVDesk en la red de la oficina"
+                                Protocol="tcp" Port="47070" Scope="any" Profile="private" />
+        </File>
+      </Component>
+      <Component Id="License">
+        <File Id="LicenseFile" Source="LICENSE" Name="LICENSE.txt" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main">
+      <ComponentGroupRef Id="Main" />
+    </Feature>
+  </Package>
+</Wix>

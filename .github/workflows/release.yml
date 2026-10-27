@@ -1,0 +1,60 @@
+# Publica una versión de LCVDesk al hacer push de una etiqueta vX.Y.Z.
+# Compila el MSI, calcula su SHA-256 y crea la Release de GitHub con ambos archivos.
+# El updater de la app lee estas Releases para ofrecer la actualización.
+#
+# Antes de etiquetar: subir la versión en Cargo.toml ([workspace.package] version)
+# y que coincida con la etiqueta (la etiqueta v0.3.0 ⇒ Cargo.toml 0.3.0).
+name: Publicar versión
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  publicar:
+    runs-on: windows-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Preparar Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cachear dependencias de cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Instalar WiX 5
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.Firewall.wixext/5.0.2
+
+      - name: Comprobar que la etiqueta coincide con Cargo.toml
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $cargo = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
+            Where-Object name -eq 'lcvdesk' | Select-Object -ExpandProperty version
+          if ($tag -ne $cargo) { throw "La etiqueta ($tag) no coincide con Cargo.toml ($cargo)." }
+
+      - name: Compilar el MSI
+        shell: pwsh
+        run: .\tools\build-msi.ps1
+
+      - name: Crear la Release con el MSI y su SHA-256
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          $msi = "dist\LCVDesk-$version-x64.msi"
+          $notes = "notas.md"
+          if (-not (Test-Path $notes)) { "LCVDesk $version" | Set-Content $notes -Encoding utf8 }
+          gh release create "${{ github.ref_name }}" "$msi" "$msi.sha256" `
+            --title "LCVDesk $version" --notes-file $notes

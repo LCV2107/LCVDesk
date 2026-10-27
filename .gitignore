@@ -1,0 +1,33 @@
+# Build de Rust
+/target/
+**/*.rs.bk
+
+# Repositorios de referencia (se recuperan con tools/fetch-references.ps1)
+/reference/*/
+
+# Datos locales de ejecución
+*.log
+*.trace
+/trusted.json
+
+# Secretos y credenciales (no subir nunca)
+*.key
+*.pem
+*.pfx
+*.p12
+*.pkcs12
+.env
+.env.*
+*.secret
+secrets.*
+credentials*
+id_rsa*
+*token*.txt
+
+# Editores / sistema
+.vscode/settings.json
+.idea/
+Thumbs.db
+
+# Instaladores generados
+/dist/
