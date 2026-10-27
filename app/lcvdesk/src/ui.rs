@@ -126,6 +126,8 @@ struct App {
     last_mouse: Option<(u16, u16)>,
     /// El control remoto está activo (la vista tiene el foco).
     controlling: bool,
+    /// Captura de teclado activa: todas las teclas (Windows, Alt+Tab…) van al equipo remoto.
+    capture: bool,
     /// Tema de la interfaz (persistido).
     theme: Theme,
     /// Canal de actualizaciones (persistido).
@@ -158,6 +160,7 @@ impl App {
             sent_mods: Modifiers::default(),
             last_mouse: None,
             controlling: false,
+            capture: true,
             theme: Theme::from_str(&crate::settings::load_theme()),
             channel: Channel::from_str(&crate::settings::load_channel()),
             update_dismissed: false,
@@ -655,10 +658,23 @@ impl App {
             self.present_ms = f.received.elapsed().as_secs_f32() * 1000.0;
         }
 
+        let mut toggle_capture = false;
         ui.horizontal(|ui| {
             let viewer = self.viewer.as_ref().unwrap();
             if ui.button("Desconectar").clicked() {
                 viewer.disconnect();
+            }
+            // Captura de teclado: cuando está activa, la tecla Windows, Alt+Tab, etc. van al remoto.
+            if status_text.is_none() {
+                ui.separator();
+                let (txt, col) = if self.capture {
+                    ("⌨ Teclado capturado", GREEN)
+                } else {
+                    ("⌨ Capturar teclado", Color32::GRAY)
+                };
+                if ui.button(RichText::new(txt).color(col)).on_hover_text("Soltar/recuperar con Ctrl+Alt+Inicio").clicked() {
+                    toggle_capture = true;
+                }
             }
             // Selector de monitor (solo si el equipo remoto tiene más de uno).
             if displays.len() > 1 {
@@ -689,15 +705,24 @@ impl App {
                 }
             };
         });
+        if toggle_capture {
+            self.capture = !self.capture;
+            if !self.capture {
+                if let Some(v) = self.viewer.as_ref() {
+                    v.send(&Message::ReleaseAll);
+                }
+                self.sent_mods = Modifiers::default();
+            }
+        }
         if status_text.is_none() {
-            ui.label(
-                RichText::new(
-                    "Tu ratón y teclado controlan el equipo remoto mientras esta ventana esté activa \
-                     (la tecla Windows, Alt+Tab, etc. van al remoto). Cambia de ventana para soltar.",
-                )
-                .small()
-                .color(Color32::GRAY),
-            );
+            let msg = if self.capture {
+                "Teclado capturado: la tecla Windows, Alt+Tab, etc. van al equipo remoto. \
+                 Pulsa Ctrl+Alt+Inicio para soltar el teclado y volver a tu equipo."
+            } else {
+                "Teclado NO capturado: tus teclas actúan en tu equipo. Pulsa «Capturar teclado» \
+                 (o Ctrl+Alt+Inicio) para enviarlas al remoto. El ratón sigue controlando al pasar por la imagen."
+            };
+            ui.label(RichText::new(msg).small().color(if self.capture { GREEN } else { ORANGE }));
         }
 
         let area = ui.available_rect_before_wrap();
@@ -757,8 +782,9 @@ impl App {
         });
     }
 
-    /// Reenvía ratón y teclado al host mientras la ventana de la sesión esté activa (enfocada),
-    /// como RustDesk/AnyDesk: no hace falta "tomar control" con un clic previo.
+    /// Reenvía ratón y teclado al host. El teclado se captura en "modo captura" (todas las teclas,
+    /// incluida Windows/Alt+Tab, van al remoto); el hook solo suprime cuando la ventana es nuestra.
+    /// El ratón se reenvía siempre que el puntero esté sobre la imagen. Ctrl+Alt+Inicio suelta.
     fn handle_control(&mut self, ui: &egui::Ui, response: &egui::Response, image_rect: Option<Rect>) {
         let _ = response;
         let Some(viewer) = self.viewer.as_ref() else { return };
@@ -767,20 +793,18 @@ impl App {
             return;
         };
 
-        // Activo mientras la ventana de LCVDesk esté enfocada. El hook además comprueba que estemos
-        // en primer plano, así que no robamos el teclado a otras aplicaciones.
-        let active = ui.ctx().input(|i| i.focused);
-        let use_hook = keyhook::installed();
-        keyhook::set_grab(active && use_hook);
-        if !active {
-            if self.controlling {
+        // Ctrl+Alt+Inicio alterna la captura del teclado.
+        if keyhook::take_release_request() {
+            self.capture = !self.capture;
+            if !self.capture {
                 viewer.send(&Message::ReleaseAll);
                 self.sent_mods = Modifiers::default();
-                self.controlling = false;
             }
-            return;
         }
-        self.controlling = true;
+
+        let use_hook = keyhook::installed();
+        keyhook::set_grab(self.capture && use_hook);
+        self.controlling = self.capture;
 
         // --- Ratón: posición normalizada 0..=65535 sobre la imagen remota. ---
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
@@ -796,9 +820,11 @@ impl App {
 
         // --- Eventos (botones, rueda, teclado). ---
         let (events, mods) = ui.input(|i| (i.events.clone(), i.modifiers));
+        // Respaldo de teclado por eventos de egui solo si no hay hook y el modo captura está activo.
+        let kbd_fallback = !use_hook && self.capture;
         // Modificadores (solo en el respaldo sin hook): enviar los cambios de Ctrl/Shift/Alt como
         // pulsaciones de tecla. Se escribe en self.sent_mods mientras `viewer` sigue prestado.
-        if !use_hook {
+        if kbd_fallback {
             let prev = self.sent_mods;
             let send_mod = |vk: u16, down: bool| {
                 if let Some((sc, ext)) = keymap::vk_to_scancode(vk) {
@@ -832,12 +858,12 @@ impl App {
                     }
                 }
                 // El teclado con hook se reenvía por scancode desde keyhook; aquí solo el respaldo.
-                Event::Text(text) if !use_hook && !mods.ctrl && !mods.alt && !mods.command => {
+                Event::Text(text) if kbd_fallback && !mods.ctrl && !mods.alt && !mods.command => {
                     for ch in text.chars() {
                         viewer.send(&Message::Unicode { ch: ch as u32 });
                     }
                 }
-                Event::Key { key, pressed, .. } if !use_hook => {
+                Event::Key { key, pressed, .. } if kbd_fallback => {
                     // El texto imprimible sin modificadores ya se envía como Unicode; evita duplicar.
                     let is_shortcut = mods.ctrl || mods.alt || mods.command;
                     if keymap::is_text_key(*key) && !is_shortcut {

@@ -6,7 +6,7 @@
 //! el menú Inicio o cambiar de ventana en tu equipo y actúan en el equipo controlado.
 //!
 //! El hook no se puede enganchar a Ctrl+Alt+Supr (secuencia segura de Windows); eso queda, a
-//! propósito, fuera del alcance. Para soltar el control, haz clic fuera de la imagen remota.
+//! propósito, fuera del alcance. Para soltar el teclado se usa Ctrl+Alt+Inicio (o el botón).
 //!
 //! Enfoque equivalente al "keyboard grab" de RustDesk/AnyDesk.
 
@@ -25,6 +25,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 /// ¿Debe capturar y suprimir las teclas ahora mismo? (true solo mientras controlas).
 static GRAB: AtomicBool = AtomicBool::new(false);
+/// Estado de Ctrl/Alt (para detectar la combinación de escape sin depender de nada más).
+static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+static ALT_DOWN: AtomicBool = AtomicBool::new(false);
+/// El usuario pidió soltar el teclado con Ctrl+Alt+Inicio; la interfaz lo consulta.
+static RELEASE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn sink() -> &'static Mutex<Option<Sender<Message>>> {
     static SINK: OnceLock<Mutex<Option<Sender<Message>>>> = OnceLock::new();
@@ -83,13 +88,33 @@ pub fn set_sink(tx: Option<Sender<Message>>) {
     *sink().lock().unwrap_or_else(|e| e.into_inner()) = tx;
 }
 
+/// ¿Se pulsó la combinación de escape (Ctrl+Alt+Inicio) desde la última consulta?
+pub fn take_release_request() -> bool {
+    RELEASE_REQUESTED.swap(false, Ordering::Relaxed)
+}
+
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 && GRAB.load(Ordering::Relaxed) && foreground_is_ours() {
+    if code == HC_ACTION as i32 && foreground_is_ours() {
         let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         let m = wparam.0 as u32;
         let down = m == WM_KEYDOWN || m == WM_SYSKEYDOWN;
         let up = m == WM_KEYUP || m == WM_SYSKEYUP;
-        if (down || up) && kb.scanCode != 0 {
+        if down || up {
+            // Seguir Ctrl/Alt y detectar el interruptor de captura (Ctrl+Alt+Inicio), siempre que la
+            // ventana sea nuestra, esté o no activa la captura (así se puede volver a capturar).
+            match kb.vkCode {
+                0xA2 | 0xA3 | 0x11 => CTRL_DOWN.store(down, Ordering::Relaxed), // Ctrl
+                0xA4 | 0xA5 | 0x12 => ALT_DOWN.store(down, Ordering::Relaxed),  // Alt
+                0x24 if down && CTRL_DOWN.load(Ordering::Relaxed) && ALT_DOWN.load(Ordering::Relaxed) => {
+                    // VK_HOME: alterna la captura. No se reenvía ni llega al equipo local.
+                    RELEASE_REQUESTED.store(true, Ordering::Relaxed);
+                    return LRESULT(1);
+                }
+                _ => {}
+            }
+        }
+        // Con la captura activa, se reenvía la tecla al remoto y se suprime en este equipo.
+        if GRAB.load(Ordering::Relaxed) && (down || up) && kb.scanCode != 0 {
             let extended = kb.flags.0 & LLKHF_EXTENDED.0 != 0;
             let msg = Message::Key { scancode: kb.scanCode as u16, extended, down };
             if let Ok(guard) = sink().lock() {
