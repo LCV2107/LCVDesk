@@ -22,6 +22,8 @@ fn main() -> anyhow::Result<()> {
         let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
             windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
         );
+        // Identidad estable en la barra de tareas: así el anclaje sobrevive a las actualizaciones.
+        let _ = windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(windows::core::w!("LCVDesk.App"));
     }
     init_logging();
     tracing::info!("LCVDesk {} iniciado", updater::current_version());

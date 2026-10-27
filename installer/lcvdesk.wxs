@@ -9,8 +9,11 @@
            Version="$(Version)"
            UpgradeCode="934321C7-3C9D-40DE-B5CF-742C669601B6"
            Scope="perMachine">
-    <!-- Reinstalar la misma versión también actualiza (útil durante las pruebas). -->
+    <!-- Reinstalar la misma versión también actualiza (útil durante las pruebas).
+         Schedule afterInstallExecute: instala la nueva versión encima y luego quita lo sobrante, en
+         vez de desinstalar primero; así el acceso directo no se elimina y el anclaje no se rompe. -->
     <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  Schedule="afterInstallExecute"
                   DowngradeErrorMessage="Ya hay instalada una versión más reciente de LCVDesk." />
     <MediaTemplate EmbedCab="yes" />
 
@@ -25,7 +28,11 @@
       <Component Id="LcvdeskExe">
         <File Id="LcvdeskExe" Source="$(BinDir)\lcvdesk.exe" KeyPath="yes">
           <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="LCVDesk"
-                    Description="Escritorio remoto en la red local" WorkingDirectory="INSTALLFOLDER" />
+                    Description="Escritorio remoto en la red local" WorkingDirectory="INSTALLFOLDER">
+            <!-- Misma identidad que fija la app (SetCurrentProcessExplicitAppUserModelID): el anclaje
+                 a la barra de tareas se mantiene aunque se actualice la aplicación. -->
+            <ShortcutProperty Key="System.AppUserModel.ID" Value="LCVDesk.App" />
+          </Shortcut>
           <!-- Conexiones entrantes del visor. Se permite en los perfiles Privado y de Dominio
                (redes de la oficina, aunque haya varias subredes), no en redes públicas.
                Para restringirlo a rangos concretos, usar tools\firewall.ps1 tras instalar. -->

@@ -270,25 +270,22 @@ fn download_and_verify(
     Ok(path)
 }
 
-/// Lanza `msiexec` elevado para instalar la actualización mayor.
+/// Instala la actualización (elevado) y, al terminar, vuelve a abrir LCVDesk con el nivel del usuario.
 fn launch_installer(path: &std::path::Path) -> Result<(), String> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::UI::Shell::ShellExecuteW;
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
     use windows::core::{PCWSTR, w};
 
-    let args = format!("/i \"{}\" /qb", path.display());
-    let args: Vec<u16> = OsStr::new(&args).encode_wide().chain([0]).collect();
+    let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into());
+    let exe = format!("{program_files}\\LCVDesk\\lcvdesk.exe");
+    // `cmd` elevado: instala con msiexec y, si va bien, relanza la app vía explorer.exe (que corre
+    // como el usuario), para que no quede elevada. El `&&` solo relanza si la instalación tuvo éxito.
+    let cmd = format!("/c msiexec /i \"{}\" /qb && explorer.exe \"{}\"", path.display(), exe);
+    let cmd: Vec<u16> = OsStr::new(&cmd).encode_wide().chain([0]).collect();
     let result = unsafe {
-        ShellExecuteW(
-            None,
-            w!("runas"),
-            w!("msiexec.exe"),
-            PCWSTR(args.as_ptr()),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        )
+        ShellExecuteW(None, w!("runas"), w!("cmd.exe"), PCWSTR(cmd.as_ptr()), PCWSTR::null(), SW_HIDE)
     };
     if result.0 as usize > 32 {
         Ok(())

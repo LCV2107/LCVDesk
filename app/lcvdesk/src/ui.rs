@@ -81,6 +81,10 @@ pub fn run(host: Host, discovery: Discovery) -> anyhow::Result<()> {
         .with_title("LCVDesk")
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([520.0, 360.0]);
+    // Icono de la ventana (barra de tareas y Alt+Tab).
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
+        options.viewport = options.viewport.with_icon(icon);
+    }
     // VSync con un solo fotograma en cola: baja latencia de presentación sin que la ventana se
     // redibuje de forma ilimitada (eso saturaba un núcleo y frenaba la captura DXGI del host).
     options.wgpu_options.surface = SurfaceConfig {
