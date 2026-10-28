@@ -42,6 +42,39 @@ pub struct Frame<'a> {
     pub data: &'a [u8],
 }
 
+/// Miniatura RGBA de un fotograma BGRA que cabe en `max_w × max_h` sin deformarse. Cada píxel es la
+/// media del bloque de origen que representa (se lee bien el texto grande y las ventanas).
+pub fn thumbnail(frame: &Frame<'_>, max_w: u32, max_h: u32) -> (u32, u32, Vec<u8>) {
+    let (w, h) = (frame.width.max(1), frame.height.max(1));
+    let scale = (max_w as f32 / w as f32).min(max_h as f32 / h as f32).min(1.0);
+    let tw = ((w as f32 * scale).round() as u32).max(1);
+    let th = ((h as f32 * scale).round() as u32).max(1);
+    let stride = w as usize * 4;
+    let mut out = Vec::with_capacity(tw as usize * th as usize * 4);
+    for ty in 0..th {
+        let y0 = (ty * h / th) as usize;
+        let y1 = (((ty + 1) * h / th) as usize).max(y0 + 1);
+        for tx in 0..tw {
+            let x0 = (tx * w / tw) as usize;
+            let x1 = (((tx + 1) * w / tw) as usize).max(x0 + 1);
+            let (mut b, mut g, mut r, mut n) = (0u32, 0u32, 0u32, 0u32);
+            for y in y0..y1.min(h as usize) {
+                let row = &frame.data[y * stride..];
+                for x in x0..x1.min(w as usize) {
+                    let p = &row[x * 4..x * 4 + 4];
+                    b += p[0] as u32;
+                    g += p[1] as u32;
+                    r += p[2] as u32;
+                    n += 1;
+                }
+            }
+            let n = n.max(1);
+            out.extend_from_slice(&[(r / n) as u8, (g / n) as u8, (b / n) as u8, 255]);
+        }
+    }
+    (tw, th, out)
+}
+
 /// Intervalo entre reintentos de DXGI mientras se usa GDI.
 const DXGI_RETRY: Duration = Duration::from_secs(2);
 
@@ -163,5 +196,30 @@ impl Capturer {
             Backend::Gdi => self.gdi.as_ref().map(|g| g.frame()),
             Backend::None => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thumbnail_keeps_aspect_and_averages() {
+        // 4x2 BGRA: mitad izquierda blanca, mitad derecha negra → 2x1 = blanco, negro.
+        let mut data = Vec::new();
+        for _ in 0..2 {
+            for x in 0..4 {
+                let v = if x < 2 { 255 } else { 0 };
+                data.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let frame = Frame { width: 4, height: 2, data: &data };
+        let (w, h, rgba) = thumbnail(&frame, 2, 2);
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(rgba, [255, 255, 255, 255, 0, 0, 0, 255]);
+        // Un 1920x1080 cabe en 240x180 como 240x135.
+        let big = vec![0u8; 1920 * 1080 * 4];
+        let (w, h, rgba) = thumbnail(&Frame { width: 1920, height: 1080, data: &big }, 240, 180);
+        assert_eq!((w, h, rgba.len()), (240, 135, 240 * 135 * 4));
     }
 }

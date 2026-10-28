@@ -5,7 +5,17 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Versión que habla esta compilación. 3 añade el audio (`Audio`, `AudioEnable`) y las miniaturas
+/// de monitores (`PreviewRequest`, `Preview`).
+pub const PROTOCOL_VERSION: u32 = 3;
+/// Versión más antigua con la que se sigue hablando (sin audio). Un host acepta cualquier visor
+/// entre esta y `PROTOCOL_VERSION`; un visor nuevo que choca con un host antiguo reintenta con esta.
+pub const MIN_PROTOCOL_VERSION: u32 = 2;
+/// Primera versión con audio: solo se envían mensajes de audio si ambos lados la alcanzan.
+pub const AUDIO_PROTOCOL_VERSION: u32 = 3;
+/// Motivo exacto con el que un host rechaza una versión que no admite (los hosts antiguos ya lo
+/// usaban): el visor lo reconoce para reintentar con `MIN_PROTOCOL_VERSION`.
+pub const REJECT_VERSION: &str = "Versión de LCVDesk incompatible";
 pub const DEFAULT_PORT: u16 = 47070;
 
 /// Descubrimiento en LAN: grupo multicast y puerto reservados para LCVDesk.
@@ -55,6 +65,37 @@ pub enum Message {
     Unicode { ch: u32 },
     /// Soltar todas las teclas/botones (al perder el foco o desconectar); evita teclas "pegadas".
     ReleaseAll,
+
+    // --- Desde la versión 3 (solo si ambos lados la alcanzan; van al final para no cambiar los
+    // índices de las variantes anteriores en postcard) ---
+    /// Host → visor: un trozo del sonido que se reproduce en el equipo remoto.
+    Audio(AudioChunk),
+    /// Visor → host: empezar o dejar de enviar el sonido (botón de silencio del visor).
+    AudioEnable { on: bool },
+    /// Visor → host: pedir una miniatura de un monitor (al pasar el cursor por su botón).
+    PreviewRequest { index: u32 },
+    /// Host → visor: miniatura de un monitor.
+    Preview(DisplayPreview),
+}
+
+/// Miniatura de un monitor del host (≤ 240×180), en RGBA de 8 bits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayPreview {
+    pub index: u32,
+    pub width: u32,
+    pub height: u32,
+    #[serde(with = "serde_bytes")]
+    pub rgba: Vec<u8>,
+}
+
+/// Sonido del host: PCM de 16 bits con signo, little-endian, canales intercalados. Sin comprimir:
+/// en red local son ~1,5 Mbps a 48 kHz estéreo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioChunk {
+    pub sample_rate: u32,
+    pub channels: u16,
+    #[serde(with = "serde_bytes")]
+    pub pcm: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +204,33 @@ pub fn decode_discovery(data: &[u8]) -> Option<DiscoveryPacket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Los visores y hosts de la versión 2 decodifican por índice de variante: los antiguos no pueden
+    /// moverse. Si este test falla, se ha insertado una variante en medio del enum.
+    #[test]
+    fn v2_variant_indexes_unchanged() {
+        assert_eq!(postcard::to_allocvec(&Message::RequestKeyframe).unwrap(), [8]);
+        assert_eq!(postcard::to_allocvec(&Message::ReleaseAll).unwrap(), [16]);
+        assert_eq!(postcard::to_allocvec(&Message::AudioEnable { on: true }).unwrap(), [18, 1]);
+    }
+
+    #[test]
+    fn audio_roundtrip() {
+        let msgs = [
+            Message::AudioEnable { on: false },
+            Message::Audio(AudioChunk { sample_rate: 48_000, channels: 2, pcm: vec![1, 0, 255, 127, 0, 128] }),
+            Message::PreviewRequest { index: 1 },
+            Message::Preview(DisplayPreview { index: 1, width: 1, height: 1, rgba: vec![10, 20, 30, 255] }),
+        ];
+        let mut wire = Vec::new();
+        for m in &msgs {
+            write_message(&mut wire, m).unwrap();
+        }
+        let mut cursor = io::Cursor::new(wire);
+        for m in &msgs {
+            assert_eq!(&read_message(&mut cursor).unwrap(), m);
+        }
+    }
 
     #[test]
     fn roundtrip() {

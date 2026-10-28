@@ -4,7 +4,10 @@ use anyhow::{Context, bail};
 use lcv_capture::Capturer;
 use lcv_codec::H264Encoder;
 use lcv_input::{Injector, TargetRect};
-use lcv_proto::{DisplayInfo, Message, PROTOCOL_VERSION, VideoFrame, read_message, write_message};
+use lcv_proto::{
+    AUDIO_PROTOCOL_VERSION, AudioChunk, DisplayInfo, DisplayPreview, MIN_PROTOCOL_VERSION, Message, PROTOCOL_VERSION, REJECT_VERSION,
+    VideoFrame, read_message, write_message,
+};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -132,8 +135,10 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<HostState>>, busy: &Arc<Atomi
     let reject = |stream: &mut TcpStream, reason: &str| {
         let _ = write_message(stream, &Message::Rejected { reason: reason.into() });
     };
-    if version != PROTOCOL_VERSION {
-        reject(&mut stream, "Versión de LCVDesk incompatible");
+    // Se admiten visores de versiones anteriores compatibles (sin audio); el motivo del rechazo es
+    // el mismo que usaban los hosts antiguos, para que un visor nuevo sepa reintentar.
+    if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
+        reject(&mut stream, REJECT_VERSION);
         bail!("versión {version} incompatible");
     }
     if state.lock().unwrap().session.is_some() {
@@ -163,7 +168,7 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<HostState>>, busy: &Arc<Atomi
         st.session = Some(SessionInfo { peer, name, stop: stop.clone(), stream: stream.try_clone()? });
     }
     busy.store(true, Ordering::Relaxed);
-    let result = run_session(stream, stop);
+    let result = run_session(stream, stop, version);
     busy.store(false, Ordering::Relaxed);
     state.lock().unwrap().session = None;
     info!("sesión con {peer} cerrada");
@@ -220,7 +225,7 @@ fn target_rect(d: &lcv_capture::DisplayInfo) -> TargetRect {
     TargetRect { x: d.x, y: d.y, width: d.width, height: d.height }
 }
 
-fn run_session(stream: TcpStream, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
+fn run_session(stream: TcpStream, stop: Arc<AtomicBool>, peer_version: u32) -> anyhow::Result<()> {
     let fps: f32 = crate::env_or("LCVDESK_FPS", 60.0);
     let bitrate = crate::env_or("LCVDESK_BITRATE_MBPS", 25u32) * 1_000_000;
     // Un IDR periódico acota cuánto dura una posible congelación si el visor pierde la sincronía.
@@ -243,7 +248,12 @@ fn run_session(stream: TcpStream, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
         displays: displays.iter().map(to_proto).collect(),
         current: cur.index,
     })?;
-    spawn_writer(stream.try_clone()?, rx, stop.clone());
+    // Audio: cola propia (~1 s de trozos de 20 ms) para que el vídeo no lo retrase ni lo descarte.
+    let (audio_tx, audio_rx) = mpsc::sync_channel::<Message>(50);
+    let audio_on = Arc::new(AtomicBool::new(false));
+    // Peticiones de miniatura de monitor (botones 1 2 3… del visor).
+    let (preview_tx, preview_rx) = mpsc::channel::<u32>();
+    spawn_writer(stream.try_clone()?, rx, audio_rx, stop.clone());
     spawn_reader(
         stream.try_clone()?,
         tx.clone(),
@@ -252,7 +262,15 @@ fn run_session(stream: TcpStream, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
         stop.clone(),
         displays.clone(),
         target_rect(&cur),
+        audio_on.clone(),
+        preview_tx,
     );
+    if peer_version >= AUDIO_PROTOCOL_VERSION {
+        spawn_audio(audio_tx, audio_on, stop.clone());
+        spawn_previews(preview_rx, displays.clone(), tx.clone(), stop.clone());
+    } else {
+        info!("el visor usa la versión {peer_version} del protocolo: sesión sin audio");
+    }
 
     let interval = Duration::from_secs_f32(1.0 / fps);
     let mut encoder: Option<H264Encoder> = None;
@@ -348,18 +366,114 @@ fn run_session(stream: TcpStream, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
     result
 }
 
-/// Hilo único de escritura al socket: envía en orden todo lo que llega por la cola.
-fn spawn_writer(mut stream: TcpStream, rx: mpsc::Receiver<Message>, stop: Arc<AtomicBool>) {
+/// Hilo único de escritura al socket. El audio va primero: son trozos pequeños y cualquier espera
+/// detrás de un fotograma grande se oiría como un corte.
+fn spawn_writer(
+    mut stream: TcpStream,
+    rx: mpsc::Receiver<Message>,
+    audio_rx: mpsc::Receiver<Message>,
+    stop: Arc<AtomicBool>,
+) {
     thread::Builder::new()
         .name("host-writer".into())
         .spawn(move || {
-            for msg in rx {
-                if write_message(&mut stream, &msg).is_err() {
-                    break;
+            'out: loop {
+                while let Ok(chunk) = audio_rx.try_recv() {
+                    if write_message(&mut stream, &chunk).is_err() {
+                        break 'out;
+                    }
+                }
+                match rx.recv_timeout(Duration::from_millis(5)) {
+                    Ok(msg) => {
+                        if write_message(&mut stream, &msg).is_err() {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
             stop.store(true, Ordering::Relaxed);
             let _ = stream.shutdown(Shutdown::Both);
+        })
+        .ok();
+}
+
+/// Miniaturas de monitores bajo demanda: captura ese monitor con GDI (independiente de la captura
+/// DXGI del monitor que se está transmitiendo), lo reduce a ≤ 240×180 y lo envía. Como mucho una por
+/// monitor cada 500 ms, por si el visor insiste.
+fn spawn_previews(
+    rx: mpsc::Receiver<u32>,
+    displays: Vec<lcv_capture::DisplayInfo>,
+    tx: SyncSender<Message>,
+    stop: Arc<AtomicBool>,
+) {
+    thread::Builder::new()
+        .name("host-previews".into())
+        .spawn(move || {
+            let mut grabbers: std::collections::HashMap<u32, lcv_capture::Gdi> = Default::default();
+            let mut last_sent: std::collections::HashMap<u32, Instant> = Default::default();
+            while !stop.load(Ordering::Relaxed) {
+                let index = match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(i) => i,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                if last_sent.get(&index).is_some_and(|t| t.elapsed() < Duration::from_millis(500)) {
+                    continue;
+                }
+                let Some(d) = displays.iter().find(|d| d.index == index) else { continue };
+                let grabber = match grabbers.entry(index) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => match lcv_capture::Gdi::new(d.x, d.y, d.width, d.height) {
+                        Ok(g) => e.insert(g),
+                        Err(err) => {
+                            warn!("miniatura del monitor {index}: {err}");
+                            continue;
+                        }
+                    },
+                };
+                if let Err(err) = grabber.capture() {
+                    warn!("miniatura del monitor {index}: {err}");
+                    continue;
+                }
+                let (width, height, rgba) = lcv_capture::thumbnail(&grabber.frame(), 240, 180);
+                let msg = Message::Preview(DisplayPreview { index, width, height, rgba });
+                // Si la cola del vídeo está llena se omite; el visor la vuelve a pedir enseguida.
+                if tx.try_send(msg).is_ok() {
+                    last_sent.insert(index, Instant::now());
+                }
+            }
+        })
+        .ok();
+}
+
+/// Captura el sonido del equipo mientras el visor lo tenga activado (botón 🔊), y lo envía.
+fn spawn_audio(audio_tx: SyncSender<Message>, audio_on: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
+    thread::Builder::new()
+        .name("host-audio".into())
+        .spawn(move || {
+            let mut capture: Option<lcv_audio::Loopback> = None;
+            while !stop.load(Ordering::Relaxed) {
+                let want = audio_on.load(Ordering::Relaxed);
+                if want && capture.is_none() {
+                    info!("audio: el visor lo pidió; empezando a capturar");
+                    let (tx, stop) = (audio_tx.clone(), stop.clone());
+                    capture = Some(lcv_audio::Loopback::start(move |c| {
+                        let msg = Message::Audio(AudioChunk {
+                            sample_rate: c.sample_rate,
+                            channels: c.channels,
+                            pcm: c.to_le_bytes(),
+                        });
+                        // Si la cola está llena (red o visor lentos), se pierde este trozo.
+                        !matches!(tx.try_send(msg), Err(TrySendError::Disconnected(_))) && !stop.load(Ordering::Relaxed)
+                    }));
+                } else if !want && capture.is_some() {
+                    info!("audio: el visor lo silenció; captura detenida");
+                    capture = None;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
         })
         .ok();
 }
@@ -374,6 +488,8 @@ fn spawn_reader(
     stop: Arc<AtomicBool>,
     displays: Vec<lcv_capture::DisplayInfo>,
     initial_target: TargetRect,
+    audio_on: Arc<AtomicBool>,
+    preview_tx: mpsc::Sender<u32>,
 ) {
     thread::Builder::new()
         .name("host-reader".into())
@@ -400,6 +516,10 @@ fn spawn_reader(
                     | Message::Key { .. }
                     | Message::Unicode { .. }
                     | Message::ReleaseAll)) => injector.handle(&msg),
+                    Ok(Message::AudioEnable { on }) => audio_on.store(on, Ordering::Relaxed),
+                    Ok(Message::PreviewRequest { index }) => {
+                        let _ = preview_tx.send(index);
+                    }
                     Ok(_) => {}
                     Err(_) => break,
                 }

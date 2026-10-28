@@ -8,6 +8,7 @@ license.workspace = true
 anyhow = "1.0.104"
 eframe = "0.37.0"
 hostname = "0.4.2"
+lcv-audio = { path = "../../crates/lcv-audio" }
 lcv-capture = { path = "../../crates/lcv-capture" }
 lcv-codec = { path = "../../crates/lcv-codec" }
 lcv-input = { path = "../../crates/lcv-input" }

@@ -2,8 +2,11 @@
 
 use eframe::egui;
 use lcv_codec::H264Decoder;
-use lcv_proto::{DEFAULT_PORT, DisplayInfo, Message, PROTOCOL_VERSION, read_message, write_message};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use lcv_proto::{
+    AUDIO_PROTOCOL_VERSION, DEFAULT_PORT, DisplayInfo, MIN_PROTOCOL_VERSION, Message, PROTOCOL_VERSION, REJECT_VERSION,
+    read_message, write_message,
+};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -46,6 +49,10 @@ pub struct Shared {
     /// Identidad del host (llega en `Accepted`); se usa para guardarlo en "Recientes".
     pub host_id: String,
     pub host_name: String,
+    /// El host habla una versión con audio (se sabe al aceptar la conexión).
+    pub audio_supported: bool,
+    /// Miniaturas de monitores recién llegadas; la interfaz las recoge y las convierte en texturas.
+    pub previews: Vec<lcv_proto::DisplayPreview>,
 }
 
 pub struct Viewer {
@@ -60,6 +67,10 @@ pub struct Viewer {
     pw_tx: std::sync::mpsc::Sender<Option<(String, bool)>>,
     /// Id de esta sesión como dueña del canal de teclas del hook.
     key_owner: u64,
+    /// Reproducir el sonido del equipo remoto (botón 🔊/🔇).
+    audio_on: Arc<AtomicBool>,
+    /// Última petición de miniatura por monitor (para no pedirlas en cada fotograma).
+    preview_asked: Mutex<std::collections::HashMap<u32, Instant>>,
 }
 
 impl Viewer {
@@ -72,8 +83,11 @@ impl Viewer {
             current_display: 0,
             host_id: String::new(),
             host_name: String::new(),
+            audio_supported: false,
+            previews: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
+        let audio_on = Arc::new(AtomicBool::new(crate::settings::load_audio()));
         let writer = Arc::new(Mutex::new(None));
 
         // Canal del hook de teclado → socket. Un hilo dedicado escribe las teclas capturadas para que
@@ -111,11 +125,11 @@ impl Viewer {
 
         let (pw_tx, pw_rx) = std::sync::mpsc::channel::<Option<(String, bool)>>();
 
-        let (sh, st, wr, t) = (shared.clone(), stop.clone(), writer.clone(), target.clone());
+        let (sh, st, wr, t, au) = (shared.clone(), stop.clone(), writer.clone(), target.clone(), audio_on.clone());
         thread::Builder::new()
             .name("viewer".into())
             .spawn(move || {
-                let result = run(&t, initial_password, pw_rx, &sh, &st, &wr, &ctx);
+                let result = run(&t, initial_password, pw_rx, &sh, &st, &wr, &au, &ctx);
                 let reason = match result {
                     _ if st.load(Ordering::Relaxed) => "Desconectado".to_string(),
                     Ok(reason) => reason,
@@ -126,7 +140,47 @@ impl Viewer {
                 ctx.request_repaint();
             })
             .ok();
-        Self { target, display_name, shared, stop, writer, pw_tx, key_owner }
+        Self {
+            target,
+            display_name,
+            shared,
+            stop,
+            writer,
+            pw_tx,
+            key_owner,
+            audio_on,
+            preview_asked: Mutex::new(Default::default()),
+        }
+    }
+
+    /// Pide al host una miniatura del monitor `index`, como mucho una vez cada 1,5 s por monitor
+    /// (se llama en cada fotograma mientras el cursor está sobre su botón). Solo con hosts v3.
+    pub fn request_preview(&self, index: u32) {
+        if !self.shared().audio_supported {
+            return;
+        }
+        let mut asked = lock(&self.preview_asked);
+        if asked.get(&index).is_some_and(|t| t.elapsed() < Duration::from_millis(1500)) {
+            return;
+        }
+        asked.insert(index, Instant::now());
+        drop(asked);
+        self.send(&Message::PreviewRequest { index });
+    }
+
+    /// ¿Se está reproduciendo el sonido remoto?
+    pub fn audio_on(&self) -> bool {
+        self.audio_on.load(Ordering::Relaxed)
+    }
+
+    /// Activa o silencia el sonido remoto. Con el host compatible, también le pide que deje de
+    /// capturar (no gasta red ni CPU mientras está silenciado). Se recuerda para próximas sesiones.
+    pub fn set_audio(&self, on: bool) {
+        self.audio_on.store(on, Ordering::Relaxed);
+        crate::settings::save_audio(on);
+        if self.shared().audio_supported {
+            self.send(&Message::AudioEnable { on });
+        }
     }
 
     /// La interfaz entrega la contraseña escrita por el usuario (y si debe recordarse).
@@ -174,6 +228,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     target: &str,
     initial_password: Option<String>,
@@ -181,6 +236,7 @@ fn run(
     shared: &Mutex<Shared>,
     stop: &Arc<AtomicBool>,
     writer: &Arc<Mutex<Option<TcpStream>>>,
+    audio_on: &AtomicBool,
     ctx: &egui::Context,
 ) -> std::io::Result<String> {
     let target = if target.contains(':') { target.to_string() } else { format!("{target}:{DEFAULT_PORT}") };
@@ -188,19 +244,11 @@ fn run(
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "dirección no válida"))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
-    stream.set_nodelay(true)?;
-    // Hasta que el host acepte, las lecturas despiertan cada poco para atender "Cancelar" (si se
-    // pulsó mientras aún se conectaba, todavía no había socket que cerrar).
-    stream.set_read_timeout(Some(Duration::from_millis(300)))?;
-    *lock(writer) = Some(stream.try_clone()?);
+    // Se empieza con la versión más nueva; un host antiguo la rechaza y se reintenta con la mínima.
+    let mut version = PROTOCOL_VERSION;
+    let mut stream = open(&addr, version, writer)?;
     if stop.load(Ordering::Relaxed) {
         return Ok("Conexión cancelada".into());
-    }
-
-    let name = hostname::get().map(|h| h.to_string_lossy().into_owned()).unwrap_or_else(|_| "Equipo".into());
-    if let Some(s) = lock(writer).as_mut() {
-        write_message(s, &Message::Hello { version: PROTOCOL_VERSION, name })?;
     }
     lock(shared).status = Status::WaitingAcceptance;
     ctx.request_repaint();
@@ -212,6 +260,8 @@ fn run(
     // Contraseña a usar al llegar el reto (auto-login si venía guardada) y, si procede, a recordar.
     let mut pending_password = initial_password;
     let mut remember_after: Option<String> = None;
+    // Reproductor del sonido remoto: se crea al llegar el primer trozo y se suelta al silenciar.
+    let mut player: Option<lcv_audio::Player> = None;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -271,7 +321,17 @@ fn run(
                 sh.current_display = current;
                 sh.host_id = host_id;
                 sh.host_name = host_name;
+                sh.audio_supported = version >= AUDIO_PROTOCOL_VERSION;
                 drop(sh);
+                if version >= AUDIO_PROTOCOL_VERSION {
+                    let on = audio_on.load(Ordering::Relaxed);
+                    info!("el host admite audio ({})", if on { "activado" } else { "silenciado" });
+                    if let Some(s) = lock(writer).as_mut() {
+                        write_message(s, &Message::AudioEnable { on })?;
+                    }
+                } else {
+                    info!("el host usa una versión sin audio");
+                }
                 spawn_pinger(writer.clone(), stop.clone(), clock);
                 ctx.request_repaint();
             }
@@ -280,7 +340,29 @@ fn run(
                 sh.displays = displays;
                 sh.current_display = current;
             }
+            // Host antiguo que no conoce esta versión: se reintenta con la mínima (sin audio). El
+            // rechazo por versión llega antes de pedir contraseña o aceptación, así que no se repiten.
+            Message::Rejected { reason } if reason == REJECT_VERSION && version > MIN_PROTOCOL_VERSION => {
+                info!("el host no admite la versión {version} del protocolo; reintentando con la {MIN_PROTOCOL_VERSION}");
+                version = MIN_PROTOCOL_VERSION;
+                stream = open(&addr, version, writer)?;
+            }
             Message::Rejected { reason } => return Ok(reason),
+            Message::Preview(p) => {
+                let mut sh = lock(shared);
+                sh.previews.retain(|q| q.index != p.index);
+                sh.previews.push(p);
+                drop(sh);
+                ctx.request_repaint();
+            }
+            Message::Audio(a) => {
+                if audio_on.load(Ordering::Relaxed) {
+                    let chunk = lcv_audio::Chunk::from_le_bytes(a.sample_rate, a.channels, &a.pcm);
+                    player.get_or_insert_with(lcv_audio::Player::start).push(chunk);
+                } else {
+                    player = None;
+                }
+            }
             Message::Pong { t_us } => {
                 let rtt = (clock.elapsed().as_micros() as u64).saturating_sub(t_us) as f32 / 1000.0;
                 lock(shared).stats.rtt_ms = rtt;
@@ -318,6 +400,21 @@ fn run(
             _ => {}
         }
     }
+}
+
+/// Abre la conexión TCP, la deja como punto de escritura y saluda con `version`.
+fn open(addr: &SocketAddr, version: u32, writer: &Arc<Mutex<Option<TcpStream>>>) -> std::io::Result<TcpStream> {
+    let stream = TcpStream::connect_timeout(addr, Duration::from_secs(3))?;
+    stream.set_nodelay(true)?;
+    // Hasta que el host acepte, las lecturas despiertan cada poco para atender "Cancelar" (si se
+    // pulsó mientras aún se conectaba, todavía no había socket que cerrar).
+    stream.set_read_timeout(Some(Duration::from_millis(300)))?;
+    *lock(writer) = Some(stream.try_clone()?);
+    let name = hostname::get().map(|h| h.to_string_lossy().into_owned()).unwrap_or_else(|_| "Equipo".into());
+    if let Some(s) = lock(writer).as_mut() {
+        write_message(s, &Message::Hello { version, name })?;
+    }
+    Ok(stream)
 }
 
 fn spawn_pinger(writer: Arc<Mutex<Option<TcpStream>>>, stop: Arc<AtomicBool>, clock: Instant) {

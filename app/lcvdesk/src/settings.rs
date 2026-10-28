@@ -24,6 +24,15 @@ pub fn save_channel(value: &str) {
     write_file("channel", value);
 }
 
+/// ¿Reproducir el sonido del equipo remoto? Activado por defecto.
+pub fn load_audio() -> bool {
+    std::fs::read_to_string(file_in_dir("audio")).map(|s| s.trim() != "off").unwrap_or(true)
+}
+
+pub fn save_audio(on: bool) {
+    write_file("audio", if on { "on" } else { "off" });
+}
+
 fn file_in_dir(name: &str) -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)

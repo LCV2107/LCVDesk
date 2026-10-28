@@ -1851,6 +1851,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
+name = "lcv-audio"
+version = "0.3.1"
+dependencies = [
+ "tracing",
+ "windows",
+]
+
+[[package]]
 name = "lcv-capture"
 version = "0.3.1"
 dependencies = [
@@ -1896,6 +1904,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "hostname",
+ "lcv-audio",
  "lcv-capture",
  "lcv-codec",
  "lcv-input",

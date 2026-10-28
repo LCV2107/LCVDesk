@@ -113,6 +113,8 @@ struct App {
     /// ¿Hay una contraseña de acceso configurada en este equipo?
     has_access_password: bool,
     texture: Option<TextureHandle>,
+    /// Miniaturas de los monitores remotos (vista previa al pasar el cursor por los botones 1 2 3…).
+    previews: std::collections::HashMap<u32, TextureHandle>,
     local_name: String,
     local_ip: String,
     present_ms: f32,
@@ -150,6 +152,7 @@ impl App {
             access_password: String::new(),
             has_access_password: crate::auth::has_password(),
             texture: None,
+            previews: Default::default(),
             local_name: hostname::get().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default(),
             local_ip: local_ip().unwrap_or_else(|| "sin red".into()),
             present_ms: 0.0,
@@ -417,6 +420,7 @@ impl App {
             return;
         }
         self.texture = None;
+        self.previews.clear();
         self.last_close_reason = None;
         self.controlling = false;
         self.recorded_recent = false;
@@ -682,6 +686,18 @@ impl App {
             }
             self.present_ms = f.received.elapsed().as_secs_f32() * 1000.0;
         }
+        // Miniaturas de monitores recién llegadas → texturas.
+        let fresh = self.viewer.as_ref().map(|v| std::mem::take(&mut v.shared().previews)).unwrap_or_default();
+        for p in fresh {
+            let image = ColorImage::from_rgba_unmultiplied([p.width as usize, p.height as usize], &p.rgba);
+            match self.previews.get_mut(&p.index) {
+                Some(t) => t.set(image, TextureOptions::LINEAR),
+                None => {
+                    let t = ui.ctx().load_texture(format!("preview-{}", p.index), image, TextureOptions::LINEAR);
+                    self.previews.insert(p.index, t);
+                }
+            }
+        }
 
         let mut toggle_capture = false;
         ui.horizontal(|ui| {
@@ -713,20 +729,36 @@ impl App {
                             .on_hover_text("Windows rechazó el hook de teclado. Detalles en %LOCALAPPDATA%\\LCVDesk\\lcvdesk.log");
                     }
                 }
+                // Sonido del equipo remoto (solo si su versión de LCVDesk lo envía).
+                if viewer.shared().audio_supported {
+                    let on = viewer.audio_on();
+                    let (txt, col) = if on { ("🔊 Sonido", GREEN) } else { ("🔇 Silenciado", Color32::GRAY) };
+                    if ui.button(RichText::new(txt).color(col)).on_hover_text("Oír lo que suena en el equipo remoto").clicked() {
+                        viewer.set_audio(!on);
+                    }
+                }
             }
-            // Selector de monitor (solo si el equipo remoto tiene más de uno).
+            // Monitores del equipo remoto como botones 1 2 3… con vista previa al pasar el cursor
+            // (solo si tiene más de uno). Especificación: replica/design/components.md.
             if displays.len() > 1 {
                 ui.separator();
-                ui.label("Monitor:");
-                let label = displays
-                    .iter()
-                    .find(|d| d.index == current)
-                    .map_or_else(|| current.to_string(), |d| display_label(d));
-                egui::ComboBox::from_id_salt("monitor").selected_text(label).show_ui(ui, |ui| {
+                let pal = Palette::of(ui.visuals().dark_mode);
+                let supported = viewer.shared().audio_supported;
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
                     for d in &displays {
-                        if ui.selectable_label(d.index == current, display_label(d)).clicked() && d.index != current {
+                        let active = d.index == current;
+                        let resp = monitor_chip(ui, d, active, &pal);
+                        if resp.clicked() && !active {
                             viewer.select_display(d.index);
                         }
+                        if resp.hovered() && !active {
+                            viewer.request_preview(d.index);
+                            // Mientras el cursor siga ahí, la miniatura se refresca sola.
+                            ui.ctx().request_repaint_after(Duration::from_millis(250));
+                        }
+                        let tex = if active { self.texture.as_ref() } else { self.previews.get(&d.index) };
+                        resp.on_hover_ui(|ui| monitor_preview(ui, d, tex, supported || active, &pal));
                     }
                 });
             }
@@ -971,6 +1003,8 @@ fn tune_style(s: &mut egui::Style, dark: bool) {
     s.visuals.window_corner_radius = CornerRadius::same(10);
     s.spacing.item_spacing = egui::vec2(8.0, 8.0);
     s.spacing.button_padding = egui::vec2(12.0, 7.0);
+    // Las ayudas (y la vista previa de monitores) aparecen antes: 250 ms en vez de 500.
+    s.interaction.tooltip_delay = 0.25;
 }
 
 fn section_header(ui: &mut egui::Ui, text: &str) {
@@ -1019,9 +1053,109 @@ fn device_card(ui: &mut egui::Ui, name: &str, addr: &str, online: bool, busy: bo
     act
 }
 
-fn display_label(d: &lcv_proto::DisplayInfo) -> String {
-    let n = d.name.rsplit('\\').next().unwrap_or(&d.name);
-    format!("{n} ({}x{}){}", d.width, d.height, if d.primary { " ★" } else { "" })
+/// Colores del selector de monitores, de los tokens validados en replica/design/tokens*.json
+/// (0 fallos de contraste AA en claro y oscuro).
+struct Palette {
+    surface: Color32,
+    border_control: Color32,
+    accent: Color32,
+    on_accent: Color32,
+    hover_bg: Color32,
+    hover_text: Color32,
+    text_strong: Color32,
+    text_muted: Color32,
+}
+
+impl Palette {
+    fn of(dark: bool) -> Self {
+        let g = Color32::from_gray;
+        if dark {
+            Self {
+                surface: g(0x32),
+                border_control: g(0x85),
+                accent: Color32::from_rgb(0x4a, 0x90, 0xf6),
+                // Blanco sobre este azul da 3,2:1 (falla AA); azul marino da 5,2:1.
+                on_accent: Color32::from_rgb(0x0b, 0x1f, 0x3a),
+                hover_bg: Color32::from_rgb(0x29, 0x3e, 0x5d),
+                hover_text: g(0xf5),
+                text_strong: g(0xd7),
+                text_muted: g(0xa0),
+            }
+        } else {
+            Self {
+                surface: g(0xe6),
+                border_control: g(0x76),
+                accent: Color32::from_rgb(0x1a, 0x6c, 0xe0),
+                on_accent: Color32::WHITE,
+                hover_bg: Color32::from_rgb(0xd0, 0xdf, 0xf4),
+                hover_text: Color32::BLACK,
+                text_strong: g(0x3c),
+                text_muted: g(0x6e),
+            }
+        }
+    }
+}
+
+/// "Monitor 2 · 1920×1080 · principal".
+fn monitor_caption(d: &lcv_proto::DisplayInfo, sep: &str) -> String {
+    let primary = if d.primary { format!("{sep}principal") } else { String::new() };
+    format!("Monitor {}{sep}{}×{}{primary}", d.index + 1, d.width, d.height)
+}
+
+/// Botón numerado de un monitor remoto (30×24): azul el que se está viendo, gris el resto, resaltado
+/// al pasar el cursor y con anillo de foco para el teclado.
+fn monitor_chip(ui: &mut egui::Ui, d: &lcv_proto::DisplayInfo, active: bool, pal: &Palette) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 24.0), egui::Sense::click());
+    let label = monitor_caption(d, ", ");
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, active, &label));
+    if ui.is_rect_visible(rect) {
+        let hot = resp.hovered() || resp.has_focus();
+        let (fill, stroke, text) = if active {
+            (pal.accent, Stroke::NONE, pal.on_accent)
+        } else if hot {
+            (pal.hover_bg, Stroke::new(1.0, pal.accent), pal.hover_text)
+        } else {
+            (pal.surface, Stroke::new(1.0, pal.border_control), pal.text_strong)
+        };
+        let painter = ui.painter();
+        painter.rect(rect, CornerRadius::same(6), fill, stroke, egui::StrokeKind::Inside);
+        if resp.has_focus() {
+            painter.rect_stroke(rect.expand(2.0), CornerRadius::same(8), Stroke::new(2.0, pal.accent), egui::StrokeKind::Outside);
+        }
+        let number = (d.index + 1).to_string();
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, number, egui::FontId::proportional(13.0), text);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Vista previa de un monitor (≤ 240×180, en su proporción) con su pie. Sin imagen todavía: un
+/// recuadro con spinner; si el host es antiguo y no sabe enviarlas, un aviso.
+fn monitor_preview(ui: &mut egui::Ui, d: &lcv_proto::DisplayInfo, tex: Option<&TextureHandle>, supported: bool, pal: &Palette) {
+    let aspect = d.height.max(1) as f32 / d.width.max(1) as f32;
+    let (mut w, mut h) = (240.0, 240.0 * aspect);
+    if h > 180.0 {
+        (w, h) = (180.0 / aspect, 180.0);
+    }
+    let size = egui::vec2(w, h);
+    // Siempre en columna (imagen y debajo el pie), sea cual sea la disposición del contenedor.
+    ui.vertical(|ui| {
+        ui.set_max_width(w);
+        match tex {
+            Some(t) => {
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(t.id(), size)).corner_radius(6));
+            }
+            None if !supported => {
+                ui.add(egui::Label::new("Actualiza LCVDesk en el equipo remoto para ver la vista previa.").wrap());
+            }
+            None => {
+                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                ui.painter().rect_filled(rect, CornerRadius::same(6), pal.surface);
+                // paint_at solo pinta: ui.put movería el cursor y el pie quedaría encima del recuadro.
+                egui::Spinner::new().paint_at(ui, egui::Rect::from_center_size(rect.center(), egui::vec2(22.0, 22.0)));
+            }
+        }
+        ui.label(RichText::new(monitor_caption(d, " · ")).small().color(pal.text_muted));
+    });
 }
 
 fn map_button(b: PointerButton) -> Option<MouseButton> {
