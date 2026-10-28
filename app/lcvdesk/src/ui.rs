@@ -167,6 +167,16 @@ impl App {
         }
     }
 
+    /// Busca actualizaciones según el canal. En Estable con una beta instalada, ofrece volver a la
+    /// última estable aunque sea más antigua (cambio de canal "hacia atrás").
+    fn check_updates(&self, ctx: &egui::Context) {
+        if !self.channel.is_beta() && updater::current_version().contains('-') {
+            self.updater.check_stable(ctx.clone());
+        } else {
+            self.updater.check(ctx.clone(), self.channel.is_beta());
+        }
+    }
+
     /// Devuelve la versión nueva encontrada (si la hay), para avisos y actualización obligatoria.
     fn found_release(&self) -> Option<updater::Release> {
         match &*self.updater.status() {
@@ -262,7 +272,7 @@ impl App {
                         self.channel = c;
                         crate::settings::save_channel(c.as_str());
                         self.update_dismissed = false;
-                        self.updater.check(ui.ctx().clone(), self.channel.is_beta());
+                        self.check_updates(ui.ctx());
                     }
                 }
             });
@@ -333,7 +343,12 @@ impl App {
         Frame::group(ui.style()).fill(tint).stroke(Stroke::new(1.0, accent)).corner_radius(10).inner_margin(10).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.colored_label(accent, "●");
-                ui.label(RichText::new(format!("Actualización disponible: {}", r.version)).strong());
+                let text = if r.downgrade {
+                    format!("Volver a la versión estable: {}", r.version)
+                } else {
+                    format!("Actualización disponible: {}", r.version)
+                };
+                ui.label(RichText::new(text).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Ahora no").clicked() {
                         self.update_dismissed = true;
@@ -529,11 +544,15 @@ impl App {
         let busy = matches!(&*self.updater.status(), Status::Checking | Status::Downloading(_) | Status::Installing);
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(!busy, egui::Button::new("Buscar actualizaciones")).clicked() {
-                self.updater.check(ui.ctx().clone(), self.channel.is_beta());
+                self.check_updates(ui.ctx());
             }
             // El botón de instalar solo aparece si hay una versión encontrada.
-            let found = matches!(&*self.updater.status(), Status::Found(_));
-            if found && ui.button("Descargar e instalar").clicked() {
+            let found = match &*self.updater.status() {
+                Status::Found(r) => Some(r.downgrade),
+                _ => None,
+            };
+            let label = if found == Some(true) { "Volver a la estable" } else { "Descargar e instalar" };
+            if found.is_some() && ui.button(label).clicked() {
                 if let Status::Found(r) = &*self.updater.status() {
                     let release = r.clone();
                     self.updater.install(release, ui.ctx().clone());
@@ -551,6 +570,12 @@ impl App {
             }
             Status::UpToDate => {
                 ui.colored_label(Color32::from_rgb(40, 160, 70), "Estás en la última versión.");
+            }
+            Status::Found(r) if r.downgrade => {
+                ui.colored_label(
+                    Color32::from_rgb(40, 110, 220),
+                    format!("Versión estable disponible: {} (se desinstala la beta y se instala la estable)", r.version),
+                );
             }
             Status::Found(r) => {
                 ui.colored_label(Color32::from_rgb(40, 110, 220), format!("Hay una versión nueva: {}", r.version));
@@ -661,7 +686,9 @@ impl App {
         let mut toggle_capture = false;
         ui.horizontal(|ui| {
             let viewer = self.viewer.as_ref().unwrap();
-            if ui.button("Desconectar").clicked() {
+            // Antes de que acepten (conectando / esperando) sirve para cancelar el intento.
+            let label = if status_text.is_some() { "Cancelar" } else { "Desconectar" };
+            if ui.button(label).clicked() {
                 viewer.disconnect();
             }
             // Captura de teclado: cuando está activa, la tecla Windows, Alt+Tab, etc. van al remoto.
@@ -888,7 +915,7 @@ impl eframe::App for App {
         // Comprobación automática de actualizaciones, una vez al arrancar.
         if !self.update_checked {
             self.update_checked = true;
-            self.updater.check(ui.ctx().clone(), self.channel.is_beta());
+            self.check_updates(ui.ctx());
         }
         let critical = self.found_release().filter(|r| r.critical);
         self.status_strip(ui);

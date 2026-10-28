@@ -40,6 +40,8 @@ pub struct Release {
     pub size: u64,
     /// La actualización es crítica (las notas incluyen la marca `[critical]`): se obliga a instalar.
     pub critical: bool,
+    /// Es una vuelta atrás (de una beta a la estable, más antigua): hay que desinstalar antes.
+    pub downgrade: bool,
 }
 
 pub enum Status {
@@ -68,6 +70,15 @@ impl Updater {
 
     /// Busca una versión nueva en segundo plano (no bloquea la interfaz). `beta` incluye los prereleases.
     pub fn check(&self, ctx: egui::Context, beta: bool) {
+        self.spawn_check(ctx, move || fetch_latest(beta));
+    }
+
+    /// Busca la última versión estable para volver a ella desde una beta, aunque sea más antigua.
+    pub fn check_stable(&self, ctx: egui::Context) {
+        self.spawn_check(ctx, fetch_stable);
+    }
+
+    fn spawn_check(&self, ctx: egui::Context, fetch: impl FnOnce() -> Result<Option<Release>, String> + Send + 'static) {
         if self.busy.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -77,7 +88,7 @@ impl Updater {
         std::thread::Builder::new()
             .name("updater-check".into())
             .spawn(move || {
-                let result = fetch_latest(beta);
+                let result = fetch();
                 *status.lock().unwrap() = match result {
                     Ok(Some(r)) => {
                         info!("versión disponible: {}", r.version);
@@ -113,7 +124,7 @@ impl Updater {
                 match download_and_verify(&release, &status, &ctx2) {
                     Ok(path) => {
                         set(Status::Installing);
-                        if let Err(e) = launch_installer(&path) {
+                        if let Err(e) = launch_installer(&path, release.downgrade) {
                             set(Status::Error(e));
                             busy.store(false, Ordering::SeqCst);
                             return;
@@ -142,6 +153,29 @@ fn agent() -> ureq::Agent {
 /// Consulta las versiones y devuelve la más reciente mayor que la actual que traiga un `.msi`.
 /// Con `beta=false` ignora los prereleases; con `beta=true` también los considera.
 fn fetch_latest(beta: bool) -> Result<Option<Release>, String> {
+    let current = parse_version(current_version()).ok_or("versión local inválida")?;
+    let best = list_releases()?
+        .into_iter()
+        .filter(|(v, _, pre)| (beta || !pre) && cmp(v, &current) > 0)
+        .max_by(|(a, ..), (b, ..)| cmp(a, b).cmp(&0));
+    Ok(best.map(|(_, r, _)| r))
+}
+
+/// La última versión estable, para volver a ella desde una beta. Si es más antigua que la instalada,
+/// se marca como vuelta atrás (`downgrade`). `None` si ya estás en ella.
+fn fetch_stable() -> Result<Option<Release>, String> {
+    let current = parse_version(current_version()).ok_or("versión local inválida")?;
+    let best = list_releases()?.into_iter().filter(|(_, _, pre)| !pre).max_by(|(a, ..), (b, ..)| cmp(a, b).cmp(&0));
+    Ok(best.filter(|(v, ..)| cmp(v, &current) != 0).map(|(v, mut r, _)| {
+        r.downgrade = cmp(&v, &current) < 0;
+        // Volver atrás es una elección del usuario: nunca se impone como actualización crítica.
+        r.critical &= !r.downgrade;
+        r
+    }))
+}
+
+/// Todas las versiones publicadas (no borradores) con su `.msi` y `.sha256`: (versión, datos, ¿prerelease?).
+fn list_releases() -> Result<Vec<(Ver, Release, bool)>, String> {
     let url = format!("https://api.github.com/repos/{}/releases?per_page=30", repo());
     let body = agent()
         .get(&url)
@@ -152,24 +186,14 @@ fn fetch_latest(beta: bool) -> Result<Option<Release>, String> {
         .into_string()
         .map_err(|e| e.to_string())?;
     let releases: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    let current = parse_version(current_version()).ok_or("versión local inválida")?;
 
-    let mut best: Option<(Ver, Release)> = None;
+    let mut out = Vec::new();
     for r in releases.as_array().into_iter().flatten() {
         if r["draft"].as_bool() == Some(true) {
             continue;
         }
-        // Los prereleases (betas) solo cuentan en el canal Beta.
-        if r["prerelease"].as_bool() == Some(true) && !beta {
-            continue;
-        }
+        let prerelease = r["prerelease"].as_bool() == Some(true);
         let Some(v) = r["tag_name"].as_str().and_then(parse_version) else { continue };
-        if cmp(&v, &current) <= 0 {
-            continue;
-        }
-        if best.as_ref().is_some_and(|(bv, _)| cmp(&v, bv) <= 0) {
-            continue;
-        }
         let (mut msi_url, mut sha_url, mut size) = (None, None, 0u64);
         for a in r["assets"].as_array().into_iter().flatten() {
             let name = a["name"].as_str().unwrap_or("");
@@ -188,7 +212,7 @@ fn fetch_latest(beta: bool) -> Result<Option<Release>, String> {
         // Una actualización crítica se marca escribiendo [critical] en las notas de la versión.
         let low = notes.to_lowercase();
         let critical = low.contains("[critical]") || low.contains("[critica]") || low.contains("[crítica]");
-        best = Some((
+        out.push((
             v,
             Release {
                 version: r["tag_name"].as_str().unwrap_or("").trim_start_matches('v').to_string(),
@@ -198,10 +222,12 @@ fn fetch_latest(beta: bool) -> Result<Option<Release>, String> {
                 sha_url: Some(sha_url),
                 size,
                 critical,
+                downgrade: false,
             },
+            prerelease,
         ));
     }
-    Ok(best.map(|(_, r)| r))
+    Ok(out)
 }
 
 fn download_and_verify(
@@ -270,8 +296,16 @@ fn download_and_verify(
     Ok(path)
 }
 
+/// Código de actualización del MSI (`UpgradeCode` en installer\lcvdesk.wxs).
+const UPGRADE_CODE: &str = "{934321C7-3C9D-40DE-B5CF-742C669601B6}";
+
 /// Instala la actualización (elevado) y, al terminar, vuelve a abrir LCVDesk con el nivel del usuario.
-fn launch_installer(path: &std::path::Path) -> Result<(), String> {
+///
+/// Lo hace un script de PowerShell que primero **espera a que esta instancia se cierre**: si msiexec
+/// corre con el .exe aún abierto, no puede reemplazarlo y lo deja para el reinicio (te quedabas en la
+/// versión anterior). Con `downgrade` (volver de una beta a la estable, más antigua) desinstala antes
+/// la versión actual, porque un MSI no reemplaza archivos por otros de versión menor.
+fn launch_installer(path: &std::path::Path, downgrade: bool) -> Result<(), String> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::UI::Shell::ShellExecuteW;
@@ -280,12 +314,36 @@ fn launch_installer(path: &std::path::Path) -> Result<(), String> {
 
     let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into());
     let exe = format!("{program_files}\\LCVDesk\\lcvdesk.exe");
-    // `cmd` elevado: instala con msiexec y, si va bien, relanza la app vía explorer.exe (que corre
-    // como el usuario), para que no quede elevada. El `&&` solo relanza si la instalación tuvo éxito.
-    let cmd = format!("/c msiexec /i \"{}\" /qb && explorer.exe \"{}\"", path.display(), exe);
-    let cmd: Vec<u16> = OsStr::new(&cmd).encode_wide().chain([0]).collect();
+    // Cadenas de PowerShell entre comillas simples: la comilla simple se escapa duplicándola.
+    let q = |s: &str| s.replace('\'', "''");
+    let uninstall = if downgrade {
+        format!(
+            "$wi = New-Object -ComObject WindowsInstaller.Installer\n\
+             $codes = $wi.GetType().InvokeMember('RelatedProducts', 'GetProperty', $null, $wi, @('{UPGRADE_CODE}'))\n\
+             foreach ($c in @($codes)) {{ Start-Process msiexec.exe -ArgumentList \"/x $c /qb /norestart\" -Wait }}\n"
+        )
+    } else {
+        String::new()
+    };
+    let script = format!(
+        "$ErrorActionPreference = 'SilentlyContinue'\n\
+         $t = 0\n\
+         while ((Get-Process -Id {pid}) -and $t -lt 200) {{ Start-Sleep -Milliseconds 300; $t++ }}\n\
+         {uninstall}\
+         $p = Start-Process msiexec.exe -ArgumentList '/i \"{msi}\" /qb /norestart' -Wait -PassThru\n\
+         if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) {{ Start-Process explorer.exe -ArgumentList '\"{exe}\"' }}\n",
+        pid = std::process::id(),
+        msi = q(&path.display().to_string()),
+        exe = q(&exe),
+    );
+    let script_path = path.with_file_name("lcvdesk-update.ps1");
+    // Con BOM, para que PowerShell 5 lea bien rutas con caracteres no ASCII.
+    std::fs::write(&script_path, [&[0xEF, 0xBB, 0xBF][..], script.as_bytes()].concat()).map_err(|e| e.to_string())?;
+
+    let args = format!("-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{}\"", script_path.display());
+    let args: Vec<u16> = OsStr::new(&args).encode_wide().chain([0]).collect();
     let result = unsafe {
-        ShellExecuteW(None, w!("runas"), w!("cmd.exe"), PCWSTR(cmd.as_ptr()), PCWSTR::null(), SW_HIDE)
+        ShellExecuteW(None, w!("runas"), w!("powershell.exe"), PCWSTR(args.as_ptr()), PCWSTR::null(), SW_HIDE)
     };
     if result.0 as usize > 32 {
         Ok(())

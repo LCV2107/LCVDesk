@@ -68,8 +68,11 @@ impl Host {
 }
 
 fn listen(port: u16, state: Arc<Mutex<HostState>>, busy: Arc<AtomicBool>) {
-    let listener = match TcpListener::bind(("0.0.0.0", port)) {
-        Ok(l) => l,
+    let listener = match bind_listener(port) {
+        Ok(l) => {
+            state.lock().unwrap().listen_error = None;
+            l
+        }
         Err(e) => {
             warn!("no se pudo escuchar en el puerto {port}: {e}");
             state.lock().unwrap().listen_error = Some(e.to_string());
@@ -90,6 +93,33 @@ fn listen(port: u16, state: Arc<Mutex<HostState>>, busy: Arc<AtomicBool>) {
             })
             .ok();
     }
+}
+
+/// Enlaza el socket de escucha con `SO_REUSEADDR` y reintenta unos segundos. Así, cuando una
+/// instancia se relanza tras actualizar, no falla con el error 10048 porque el puerto de la
+/// instancia anterior siga en `TIME_WAIT` o tarde un instante en liberarse.
+fn bind_listener(port: u16) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Socket, Type};
+    use std::net::Ipv4Addr;
+
+    let addr: SocketAddr = (Ipv4Addr::UNSPECIFIED, port).into();
+    let mut last_err = None;
+    // ~6 s de margen (15 × 400 ms): de sobra para un relanzado por actualización.
+    for intento in 0..15 {
+        let sock = Socket::new(Domain::IPV4, Type::STREAM, None)?;
+        sock.set_reuse_address(true)?;
+        match sock.bind(&addr.into()).and_then(|_| sock.listen(128)) {
+            Ok(_) => return Ok(sock.into()),
+            Err(e) => {
+                if intento == 0 {
+                    warn!("puerto {port} ocupado, reintentando: {e}");
+                }
+                last_err = Some(e);
+                thread::sleep(Duration::from_millis(400));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("no se pudo enlazar el puerto")))
 }
 
 fn handle(mut stream: TcpStream, state: &Arc<Mutex<HostState>>, busy: &Arc<AtomicBool>) -> anyhow::Result<()> {

@@ -182,7 +182,13 @@ fn run(
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "dirección no válida"))?;
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
     stream.set_nodelay(true)?;
+    // Hasta que el host acepte, las lecturas despiertan cada poco para atender "Cancelar" (si se
+    // pulsó mientras aún se conectaba, todavía no había socket que cerrar).
+    stream.set_read_timeout(Some(Duration::from_millis(300)))?;
     *lock(writer) = Some(stream.try_clone()?);
+    if stop.load(Ordering::Relaxed) {
+        return Ok("Conexión cancelada".into());
+    }
 
     let name = hostname::get().map(|h| h.to_string_lossy().into_owned()).unwrap_or_else(|_| "Equipo".into());
     if let Some(s) = lock(writer).as_mut() {
@@ -200,7 +206,16 @@ fn run(
     let mut remember_after: Option<String> = None;
 
     loop {
-        match read_message(&mut stream)? {
+        if stop.load(Ordering::Relaxed) {
+            return Ok("Conexión cancelada".into());
+        }
+        let msg = match read_message(&mut stream) {
+            Ok(m) => m,
+            // Sin datos aún (esperando que acepten): volver a comprobar si se canceló.
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+            Err(e) => return Err(e),
+        };
+        match msg {
             Message::AuthChallenge { nonce } => {
                 // Si no hay contraseña (ni guardada ni entregada), la interfaz la solicita y esperamos.
                 let password = match pending_password.take() {
@@ -240,6 +255,8 @@ fn run(
                 if let Some(pw) = remember_after.take() {
                     crate::auth::remember_password(&host_id, &pw);
                 }
+                // Ya en sesión: lecturas bloqueantes (desconectar cierra el socket y las despierta).
+                stream.set_read_timeout(None)?;
                 let mut sh = lock(shared);
                 sh.status = Status::Streaming;
                 sh.displays = displays;

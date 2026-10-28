@@ -2,9 +2,9 @@
 # Requisitos: Rust (MSVC), Windows SDK, WiX 5 (dotnet tool install --global wix --version 5.0.2)
 # y la extensión de firewall (wix extension add -g WixToolset.Firewall.wixext/5.0.2).
 #
-# -Version admite el sufijo de prerelease (p. ej. 0.2.0-beta.1). La versión del MSI es siempre la
-# base numérica (0.2.0, el MSI no admite sufijos); la versión completa se incrusta en el binario
-# vía LCVDESK_VERSION y da nombre al archivo. Sin -Version se toma la de Cargo.toml.
+# -Version admite el sufijo de prerelease (p. ej. 0.2.0-beta.1). El MSI no admite sufijos, así que
+# se le da una versión numérica derivada y creciente (ver abajo); la versión completa se incrusta en
+# el binario vía LCVDESK_VERSION y da nombre al archivo. Sin -Version se toma la de Cargo.toml.
 param([string]$Version, [switch]$SkipBuild)
 $ErrorActionPreference = 'Stop'
 $root = Resolve-Path (Join-Path $PSScriptRoot '..')
@@ -16,7 +16,18 @@ try {
         $Version = ((cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
             Where-Object name -eq 'lcvdesk').version
     }
-    $base = ($Version -split '-')[0]   # versión numérica para el MSI (sin -beta.N)
+    # Versión del MSI: estrictamente creciente en cada publicación, también entre betas, para que
+    # Windows Installer siempre la trate como actualización. Formato mayor.menor.(parche*1000+rango):
+    # alpha.N = N, beta.N = 100+N, rc.N = 200+N, final = 999. P. ej. 0.3.1-beta.2 -> 0.3.1102,
+    # 0.3.1 -> 0.3.1999. (El campo admite hasta 65535: vale para parches 0..64.)
+    $core, $pre = $Version -split '-', 2
+    $maj, $min, $pat = ($core -split '\.') + @('0', '0') | Select-Object -First 3
+    $rank = 999
+    if ($pre) {
+        $n = if ($pre -match '(\d+)$') { [Math]::Min([int]$Matches[1], 99) } else { 0 }
+        $rank = switch -Regex ($pre) { '^rc' { 200 + $n } '^beta' { 100 + $n } default { $n } }
+    }
+    $base = "$maj.$min.$([int]$pat * 1000 + $rank)"
     # La versión completa (con sufijo) se incrusta en el binario para que el updater la compare.
     $env:LCVDESK_VERSION = $Version
 

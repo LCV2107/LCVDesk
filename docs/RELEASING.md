@@ -61,7 +61,18 @@ git switch main && git merge --ff-only beta && git push origin main
   **Instalar** o **Ahora no**; también en Ajustes → *Actualizaciones*.
 - Si es **crítica**: pantalla de actualización obligatoria.
 - Al instalar: descarga el MSI, **verifica su SHA-256**, pide confirmación de administrador (UAC) y lo
-  instala encima. LCVDesk se cierra para no bloquear archivos; al terminar se vuelve a abrir.
+  instala encima. El instalador **espera a que LCVDesk se cierre** antes de ejecutar msiexec (si el
+  .exe sigue abierto no se puede reemplazar); al terminar se vuelve a abrir.
+- **Volver a estable:** con una beta instalada, elegir el canal *Estable* ofrece «Volver a la estable».
+  Si la estable es más antigua que la beta, se desinstala la beta y se instala la estable (el anclaje
+  a la barra de tareas puede perderse en ese caso).
+
+## Versión del MSI
+
+El MSI no admite sufijos, así que `build-msi.ps1` le da una versión numérica que crece en **cada**
+publicación, también entre betas: `mayor.menor.(parche*1000 + rango)`, con alpha.N = N, beta.N = 100+N,
+rc.N = 200+N y final = 999 (p. ej. `0.3.1-beta.2` → `0.3.1102`, `0.3.1` → `0.3.1999`). El `.exe` lleva
+además su versión de archivo (`0.3.1.20002`), para que Windows Installer siempre lo reemplace.
 
 ## Notas
 
