@@ -1,8 +1,10 @@
 //! DXGI Desktop Duplication (Windows 8+), con selección de monitor.
 //!
 //! Flujo: `AcquireNextFrame` → copia de la textura del escritorio a una textura *staging* →
-//! `ReleaseFrame` cuanto antes → `Map` y copia a un buffer compacto.
+//! `ReleaseFrame` cuanto antes → `Map` y copia a un buffer compacto → dibujar el puntero encima
+//! (DXGI no lo incluye en la imagen).
 
+use crate::cursor::{Overlay, Pointer, Shape, ShapeKind};
 use crate::{CaptureError, DisplayInfo, Frame};
 use std::time::Duration;
 use windows::Win32::Foundation::HMODULE;
@@ -54,6 +56,9 @@ pub struct Dxgi {
     height: u32,
     buf: Vec<u8>,
     has_frame: bool,
+    pointer: Pointer,
+    overlay: Overlay,
+    shape_buf: Vec<u8>,
 }
 
 impl Dxgi {
@@ -88,6 +93,9 @@ impl Dxgi {
             height: desc.ModeDesc.Height,
             buf: Vec::new(),
             has_frame: false,
+            pointer: Pointer::default(),
+            overlay: Overlay::default(),
+            shape_buf: Vec::new(),
         })
     }
 
@@ -99,7 +107,8 @@ impl Dxgi {
         self.height
     }
 
-    /// `Ok(true)` si hay imagen nueva en el buffer; `Ok(false)` si no cambió (o solo se movió el ratón).
+    /// `Ok(true)` si hay imagen nueva en el buffer (también si solo se movió o cambió el puntero, que
+    /// va dibujado encima); `Ok(false)` si no cambió nada.
     pub fn acquire(&mut self, timeout: Duration) -> windows::core::Result<bool> {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource = None;
@@ -117,13 +126,67 @@ impl Dxgi {
             (true, Some(resource)) => self.copy_to_staging(&resource),
             _ => Ok(false),
         };
+        // Posición y forma del puntero: hay que leerlas antes de ReleaseFrame.
+        let pointer_changed = self.update_pointer(&info);
         unsafe { self.duplication.ReleaseFrame()? };
         if copied? {
             self.read_staging()?;
+            // Imagen limpia recién copiada: lo que tapaba el puntero ya no importa.
+            self.overlay.invalidate();
             self.has_frame = true;
-            return Ok(true);
+        } else if pointer_changed && self.has_frame {
+            // Solo se movió el ratón: quitar el puntero de su sitio anterior.
+            self.overlay.restore(&mut self.buf, self.width);
+        } else {
+            return Ok(false);
         }
-        Ok(false)
+        self.overlay.draw(&mut self.buf, self.width, self.height, &self.pointer);
+        Ok(true)
+    }
+
+    /// Actualiza el puntero con lo que trae el fotograma. Devuelve si cambió su posición, visibilidad
+    /// o forma.
+    fn update_pointer(&mut self, info: &DXGI_OUTDUPL_FRAME_INFO) -> bool {
+        let mut changed = false;
+        // LastMouseUpdateTime == 0 → este fotograma no trae novedades de posición.
+        if info.LastMouseUpdateTime != 0 {
+            let p = info.PointerPosition;
+            self.pointer.visible = p.Visible.as_bool();
+            self.pointer.x = p.Position.x;
+            self.pointer.y = p.Position.y;
+            changed = true;
+        }
+        if info.PointerShapeBufferSize > 0 {
+            self.shape_buf.resize(info.PointerShapeBufferSize as usize, 0);
+            let mut required = 0u32;
+            let mut shape = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+            let ok = unsafe {
+                self.duplication.GetFramePointerShape(
+                    self.shape_buf.len() as u32,
+                    self.shape_buf.as_mut_ptr().cast(),
+                    &mut required,
+                    &mut shape,
+                )
+            };
+            let kind = match shape.Type {
+                t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32 => Some(ShapeKind::Monochrome),
+                t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32 => Some(ShapeKind::Color),
+                t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32 => Some(ShapeKind::MaskedColor),
+                _ => None,
+            };
+            if let (Ok(()), Some(kind)) = (ok, kind) {
+                let height = if kind == ShapeKind::Monochrome { shape.Height / 2 } else { shape.Height };
+                self.pointer.shape = Some(Shape {
+                    kind,
+                    width: shape.Width,
+                    height,
+                    pitch: shape.Pitch,
+                    data: self.shape_buf[..required.min(self.shape_buf.len() as u32) as usize].to_vec(),
+                });
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn frame(&self) -> Option<Frame<'_>> {

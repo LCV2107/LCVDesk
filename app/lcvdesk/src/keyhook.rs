@@ -146,6 +146,45 @@ unsafe fn install() -> Option<HHOOK> {
     }
 }
 
+/// winit registra el teclado como entrada "raw" para su ventana, y con eso Windows **deja de llamar
+/// al hook de bajo nivel de este mismo proceso** mientras nuestra ventana está delante (comprobado:
+/// de 4 a 0 llamadas). Por eso ninguna tecla llegaba al remoto. egui usa los mensajes WM_KEY*, no la
+/// entrada raw, así que se retira el registro del teclado (el del ratón se deja).
+///
+/// Se llama en cada fotograma desde la interfaz (hilo de la ventana); comprueba como mucho una vez
+/// por segundo y vuelve a retirarlo si algo lo registra de nuevo.
+pub fn maintain() {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::{GetRegisteredRawInputDevices, RAWINPUTDEVICE, RIDEV_REMOVE, RegisterRawInputDevices};
+
+    static LAST_CHECK_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+    let now_ms = now_us() / 1000;
+    let last = LAST_CHECK_MS.load(Ordering::Relaxed);
+    if last != u64::MAX && now_ms.saturating_sub(last) < 1000 {
+        return;
+    }
+    LAST_CHECK_MS.store(now_ms, Ordering::Relaxed);
+
+    let size = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
+    let mut devices = [RAWINPUTDEVICE::default(); 16];
+    let mut count = devices.len() as u32;
+    let n = unsafe { GetRegisteredRawInputDevices(Some(devices.as_mut_ptr()), &mut count, size) };
+    if n == u32::MAX {
+        return;
+    }
+    let keyboard = devices[..n as usize].iter().any(|d| d.usUsagePage == 1 && d.usUsage == 6);
+    if !keyboard {
+        return;
+    }
+    let remove = [RAWINPUTDEVICE { usUsagePage: 1, usUsage: 6, dwFlags: RIDEV_REMOVE, hwndTarget: HWND::default() }];
+    match unsafe { RegisterRawInputDevices(&remove, size) } {
+        Ok(()) => tracing::info!(
+            "entrada raw de teclado retirada (con ella, Windows no llama al hook con nuestra ventana delante)"
+        ),
+        Err(e) => tracing::error!("no se pudo retirar la entrada raw de teclado: {e}; el hook no verá las teclas"),
+    }
+}
+
 /// Estado actual del hook.
 pub fn health() -> Health {
     match HEALTH.load(Ordering::SeqCst) {
@@ -352,8 +391,9 @@ fn diagnostics() {
                     && last_rehook.is_none_or(|t| t.elapsed() > Duration::from_secs(2))
                 {
                     tracing::warn!(
-                        "hook de teclado perdido: la tecla VK 0x{vk:02X} está pulsada y el hook no recibe \
-                         nada desde hace {idle_ms} ms (probable LowLevelHooksTimeout). Reinstalando"
+                        "hook de teclado sin eventos: la tecla VK 0x{vk:02X} está pulsada y el hook no recibe \
+                         nada desde hace {idle_ms} ms (retirado por LowLevelHooksTimeout o tapado por entrada \
+                         raw). Reinstalando"
                     );
                     rehook();
                     last_rehook = Some(Instant::now());

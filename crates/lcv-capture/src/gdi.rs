@@ -18,6 +18,8 @@ pub struct Gdi {
     bits: *const u8,
     buf: Vec<u8>,
     has_frame: bool,
+    /// (handle del cursor, punto activo x, y) del último cursor dibujado.
+    cursor_hotspot: (isize, i32, i32),
 }
 
 // Los handles GDI pertenecen a este objeto y solo se usan desde el hilo que lo posee.
@@ -66,6 +68,7 @@ impl Gdi {
                 bits: bits as *const u8,
                 buf: vec![0; width as usize * height as usize * 4],
                 has_frame: false,
+                cursor_hotspot: (0, 0, 0),
             })
         }
     }
@@ -79,6 +82,8 @@ impl Gdi {
                 SRCCOPY | CAPTUREBLT,
             )
             .map_err(|e| CaptureError::Gdi(e.to_string()))?;
+            // BitBlt no copia el puntero: se dibuja encima (y así moverlo cuenta como cambio).
+            self.draw_cursor();
             let _ = GdiFlush();
             // SAFETY: la sección DIB tiene exactamente ancho × alto × 4 bytes y vive mientras `self`.
             let src = std::slice::from_raw_parts(self.bits, self.buf.len());
@@ -89,6 +94,38 @@ impl Gdi {
         }
         self.has_frame = true;
         Ok(true)
+    }
+
+    /// Dibuja el puntero del sistema en el bitmap de memoria, en su posición dentro de este monitor.
+    unsafe fn draw_cursor(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CURSOR_SHOWING, CURSORINFO, DI_NORMAL, DrawIconEx, GetCursorInfo, GetIconInfo, HICON, ICONINFO,
+        };
+        let mut ci = CURSORINFO { cbSize: size_of::<CURSORINFO>() as u32, ..Default::default() };
+        if unsafe { GetCursorInfo(&mut ci) }.is_err() || ci.flags.0 & CURSOR_SHOWING.0 == 0 || ci.hCursor.is_invalid() {
+            return;
+        }
+        let icon = HICON(ci.hCursor.0);
+        // Punto activo del cursor (la punta de la flecha), en caché por cursor: GetIconInfo crea
+        // bitmaps que hay que liberar y no compensa hacerlo en cada fotograma.
+        if self.cursor_hotspot.0 != ci.hCursor.0 as isize {
+            let mut ii = ICONINFO::default();
+            if unsafe { GetIconInfo(icon, &mut ii) }.is_err() {
+                return;
+            }
+            unsafe {
+                if !ii.hbmMask.is_invalid() {
+                    let _ = DeleteObject(ii.hbmMask.into());
+                }
+                if !ii.hbmColor.is_invalid() {
+                    let _ = DeleteObject(ii.hbmColor.into());
+                }
+            }
+            self.cursor_hotspot = (ci.hCursor.0 as isize, ii.xHotspot as i32, ii.yHotspot as i32);
+        }
+        let x = ci.ptScreenPos.x - self.origin_x - self.cursor_hotspot.1;
+        let y = ci.ptScreenPos.y - self.origin_y - self.cursor_hotspot.2;
+        let _ = unsafe { DrawIconEx(self.mem_dc, x, y, icon, 0, 0, 0, None, DI_NORMAL) };
     }
 
     pub fn width(&self) -> u32 {

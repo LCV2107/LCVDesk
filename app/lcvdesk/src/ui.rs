@@ -922,6 +922,8 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx().request_repaint_after(Duration::from_millis(500));
+        // Sin esto, el hook de teclado no recibe nada mientras nuestra ventana está delante.
+        keyhook::maintain();
         self.apply_theme(ui.ctx());
         // Comprobación automática de actualizaciones, una vez al arrancar.
         if !self.update_checked {

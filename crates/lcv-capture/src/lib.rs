@@ -3,6 +3,7 @@
 //! Igual que AnyDesk y RustDesk (`libs/scrap/src/dxgi`): DXGI Desktop Duplication como método principal
 //! y GDI (`BitBlt`) como respaldo cuando DXGI no está disponible.
 
+mod cursor;
 mod dxgi;
 mod gdi;
 
