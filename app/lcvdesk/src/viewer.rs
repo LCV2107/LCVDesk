@@ -58,6 +58,8 @@ pub struct Viewer {
     writer: Arc<Mutex<Option<TcpStream>>>,
     /// La interfaz entrega aquí la contraseña escrita (o `None` al cancelar).
     pw_tx: std::sync::mpsc::Sender<Option<(String, bool)>>,
+    /// Id de esta sesión como dueña del canal de teclas del hook.
+    key_owner: u64,
 }
 
 impl Viewer {
@@ -77,7 +79,9 @@ impl Viewer {
         // Canal del hook de teclado → socket. Un hilo dedicado escribe las teclas capturadas para que
         // la función del hook (que debe ser muy rápida) nunca bloquee escribiendo en la red.
         let (key_tx, key_rx) = std::sync::mpsc::channel::<Message>();
-        crate::keyhook::set_sink(Some(key_tx));
+        // Esta sesión pasa a ser la dueña del canal; al cerrarse solo puede retirar el suyo.
+        let key_owner = crate::keyhook::new_owner_id();
+        crate::keyhook::set_sink(key_owner, key_tx);
         {
             let (wr, st) = (writer.clone(), stop.clone());
             thread::Builder::new()
@@ -92,8 +96,13 @@ impl Viewer {
                                 info!("reenviada tecla Windows (down={down})");
                             }
                         }
-                        if let Some(s) = lock(&wr).as_mut() {
-                            let _ = write_message(s, &msg);
+                        match lock(&wr).as_mut() {
+                            Some(s) => {
+                                if let Err(e) = write_message(s, &msg) {
+                                    warn!("no se pudo enviar una tecla al host: {e}");
+                                }
+                            }
+                            None => warn!("tecla capturada antes de tener conexión; descartada"),
                         }
                     }
                 })
@@ -117,7 +126,7 @@ impl Viewer {
                 ctx.request_repaint();
             })
             .ok();
-        Self { target, display_name, shared, stop, writer, pw_tx }
+        Self { target, display_name, shared, stop, writer, pw_tx, key_owner }
     }
 
     /// La interfaz entrega la contraseña escrita por el usuario (y si debe recordarse).
@@ -148,8 +157,7 @@ impl Viewer {
 
     pub fn disconnect(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        crate::keyhook::set_grab(false);
-        crate::keyhook::set_sink(None);
+        crate::keyhook::clear_sink(self.key_owner);
         if let Some(s) = lock(&self.writer).as_ref() {
             let _ = s.shutdown(Shutdown::Both);
         }

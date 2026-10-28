@@ -702,6 +702,17 @@ impl App {
                 if ui.button(RichText::new(txt).color(col)).on_hover_text("Soltar/recuperar con Ctrl+Alt+Inicio").clicked() {
                     toggle_capture = true;
                 }
+                // Sin hook operativo, Win/Alt+Tab no se pueden capturar: avisar en vez de fallar callado.
+                match keyhook::health() {
+                    keyhook::Health::Installed | keyhook::Health::Starting => {}
+                    keyhook::Health::Lost => {
+                        ui.colored_label(ORANGE, "⚠ Recuperando el hook de teclado…");
+                    }
+                    keyhook::Health::Failed => {
+                        ui.colored_label(ORANGE, "⚠ Sin hook de teclado: Win y Alt+Tab no se envían")
+                            .on_hover_text("Windows rechazó el hook de teclado. Detalles en %LOCALAPPDATA%\\LCVDesk\\lcvdesk.log");
+                    }
+                }
             }
             // Selector de monitor (solo si el equipo remoto tiene más de uno).
             if displays.len() > 1 {
