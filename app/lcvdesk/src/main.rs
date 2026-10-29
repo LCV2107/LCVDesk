@@ -7,6 +7,7 @@ mod host;
 mod identity;
 mod keyhook;
 mod keymap;
+mod plugins;
 mod recents;
 mod settings;
 mod uac;

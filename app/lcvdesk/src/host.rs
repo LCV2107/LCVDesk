@@ -4,10 +4,13 @@ use anyhow::{Context, bail};
 use lcv_capture::Capturer;
 use lcv_codec::H264Encoder;
 use lcv_input::{Injector, TargetRect};
+use crate::plugins;
 use lcv_proto::{
-    AUDIO_PROTOCOL_VERSION, AudioChunk, DisplayInfo, DisplayPreview, MIN_PROTOCOL_VERSION, Message, PROTOCOL_VERSION, REJECT_VERSION,
-    VideoFrame, read_message, write_message,
+    AUDIO_PROTOCOL_VERSION, AudioChunk, DisplayInfo, DisplayPreview, MIN_PROTOCOL_VERSION, Message, PLUGIN_ACCESS_DENIED,
+    PLUGIN_NOT_ALLOWED, PLUGIN_NOT_INSTALLED, PLUGIN_NOT_RESPONDING, PLUGIN_UNKNOWN, PROTOCOL_VERSION, REJECT_VERSION, VideoFrame,
+    read_message, write_message,
 };
+use std::collections::HashMap;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -253,7 +256,10 @@ fn run_session(stream: TcpStream, stop: Arc<AtomicBool>, peer_version: u32) -> a
     let audio_on = Arc::new(AtomicBool::new(false));
     // Peticiones de miniatura de monitor (botones 1 2 3… del visor).
     let (preview_tx, preview_rx) = mpsc::channel::<u32>();
-    spawn_writer(stream.try_clone()?, rx, audio_rx, stop.clone());
+    // Túnel de complementos: cola propia que nunca descarta. Si la red va lenta, quien envía espera
+    // (y el complemento nota la presión en su tubería) en vez de perder datos.
+    let (plugin_tx, plugin_rx) = mpsc::sync_channel::<Message>(64);
+    spawn_writer(stream.try_clone()?, rx, audio_rx, plugin_rx, stop.clone());
     spawn_reader(
         stream.try_clone()?,
         tx.clone(),
@@ -264,6 +270,7 @@ fn run_session(stream: TcpStream, stop: Arc<AtomicBool>, peer_version: u32) -> a
         target_rect(&cur),
         audio_on.clone(),
         preview_tx,
+        plugin_tx,
     );
     if peer_version >= AUDIO_PROTOCOL_VERSION {
         spawn_audio(audio_tx, audio_on, stop.clone());
@@ -367,11 +374,12 @@ fn run_session(stream: TcpStream, stop: Arc<AtomicBool>, peer_version: u32) -> a
 }
 
 /// Hilo único de escritura al socket. El audio va primero: son trozos pequeños y cualquier espera
-/// detrás de un fotograma grande se oiría como un corte.
+/// detrás de un fotograma grande se oiría como un corte. Después, el túnel de complementos.
 fn spawn_writer(
     mut stream: TcpStream,
     rx: mpsc::Receiver<Message>,
     audio_rx: mpsc::Receiver<Message>,
+    plugin_rx: mpsc::Receiver<Message>,
     stop: Arc<AtomicBool>,
 ) {
     thread::Builder::new()
@@ -380,6 +388,11 @@ fn spawn_writer(
             'out: loop {
                 while let Ok(chunk) = audio_rx.try_recv() {
                     if write_message(&mut stream, &chunk).is_err() {
+                        break 'out;
+                    }
+                }
+                while let Ok(msg) = plugin_rx.try_recv() {
+                    if write_message(&mut stream, &msg).is_err() {
                         break 'out;
                     }
                 }
@@ -490,6 +503,7 @@ fn spawn_reader(
     initial_target: TargetRect,
     audio_on: Arc<AtomicBool>,
     preview_tx: mpsc::Sender<u32>,
+    plugin_tx: SyncSender<Message>,
 ) {
     thread::Builder::new()
         .name("host-reader".into())
@@ -497,6 +511,7 @@ fn spawn_reader(
             // El visor envía Ping cada segundo; si no llega nada en 8 s, damos la conexión por muerta.
             let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
             let mut injector = Injector::new(initial_target);
+            let channels: Arc<Mutex<HashMap<u32, Arc<plugins::Channel>>>> = Default::default();
             loop {
                 match read_message(&mut stream) {
                     // Pong y Displays no deben bloquear la lectura: si la cola está llena, se omiten.
@@ -520,12 +535,106 @@ fn spawn_reader(
                     Ok(Message::PreviewRequest { index }) => {
                         let _ = preview_tx.send(index);
                     }
+                    Ok(Message::PluginQuery) => {
+                        let _ = plugin_tx.send(Message::PluginList { items: plugins::local_list() });
+                    }
+                    Ok(Message::PluginOpen { id, channel }) => {
+                        open_plugin(id, channel, channels.clone(), plugin_tx.clone());
+                    }
+                    Ok(Message::PluginData { channel, data }) => {
+                        if let Some(ch) = lock(&channels).get(&channel) {
+                            ch.push(data);
+                        }
+                    }
+                    Ok(Message::PluginClose { channel }) => {
+                        if let Some(ch) = lock(&channels).remove(&channel) {
+                            info!("el visor cerró el complemento {} (canal {channel})", ch.plugin);
+                            ch.close();
+                        }
+                    }
                     Ok(_) => {}
                     Err(_) => break,
                 }
             }
+            // Fin de la sesión: se cierran las tuberías para que el complemento se desbloquee ya.
+            for (_, ch) in lock(&channels).drain() {
+                ch.close();
+            }
             injector.release_all();
             stop.store(true, Ordering::Relaxed);
+        })
+        .ok();
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Abre el lado controlado de un complemento (en su propio hilo: puede tardar hasta 10 s). La ruta y
+/// los argumentos salen del registro de este equipo; del visor solo se acepta un id conocido.
+fn open_plugin(
+    id: String,
+    channel: u32,
+    channels: Arc<Mutex<HashMap<u32, Arc<plugins::Channel>>>>,
+    plugin_tx: SyncSender<Message>,
+) {
+    let fail = move |tx: &SyncSender<Message>, reason: &str| {
+        let _ = tx.send(Message::PluginError { channel, reason: reason.into() });
+    };
+    if !crate::settings::load_plugins_allowed() {
+        info!("complemento {id}: rechazado (los complementos están desactivados en Ajustes)");
+        return fail(&plugin_tx, PLUGIN_NOT_ALLOWED);
+    }
+    if id != plugins::IGP_SOFT {
+        warn!("complemento desconocido pedido por el visor: {id:?}");
+        return fail(&plugin_tx, PLUGIN_UNKNOWN);
+    }
+    let Some(igp) = plugins::detect(&id) else {
+        info!("complemento {id}: no está instalado en este equipo");
+        return fail(&plugin_tx, PLUGIN_NOT_INSTALLED);
+    };
+    // Se registra antes de conectar: si el visor lo cierra mientras tanto, se abandona.
+    let ch = plugins::Channel::new(channel, &id);
+    if let Some(old) = lock(&channels).insert(channel, ch.clone()) {
+        old.close();
+    }
+    thread::Builder::new()
+        .name("host-plugin-open".into())
+        .spawn(move || {
+            let name = plugins::igp_control_pipe();
+            info!("complemento {id} {} (canal {channel}): conectando con la tubería {name}", igp.version);
+            let pipe = plugins::Pipe::connect(&name, Duration::from_millis(500)).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    return Err(e);
+                }
+                // IGP_Soft no está abierto: se abre en la bandeja y se espera su tubería.
+                plugins::launch(&igp.exe, &["--controlado".into()])?;
+                plugins::Pipe::connect(&name, plugins::CONNECT_TIMEOUT)
+            });
+            let pipe = match pipe {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("complemento {id} (canal {channel}): no se pudo conectar con {name}: {e}");
+                    lock(&channels).remove(&channel);
+                    ch.close();
+                    let reason = if e.kind() == std::io::ErrorKind::PermissionDenied { PLUGIN_ACCESS_DENIED } else { PLUGIN_NOT_RESPONDING };
+                    return fail(&plugin_tx, reason);
+                }
+            };
+            if ch.is_closed() {
+                info!("complemento {id} (canal {channel}): el visor lo cerró mientras se conectaba");
+                return;
+            }
+            info!("complemento {id} (canal {channel}): conectado");
+            let _ = plugin_tx.send(Message::PluginOpened { channel });
+            let tx = plugin_tx.clone();
+            ch.start(
+                pipe,
+                move |m| tx.send(m).is_ok(),
+                move || {
+                    lock(&channels).remove(&channel);
+                },
+            );
         })
         .ok();
 }

@@ -6,13 +6,21 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Versión que habla esta compilación. 3 añade el audio (`Audio`, `AudioEnable`) y las miniaturas
-/// de monitores (`PreviewRequest`, `Preview`).
-pub const PROTOCOL_VERSION: u32 = 3;
+/// de monitores (`PreviewRequest`, `Preview`); 4, el túnel de complementos (`Plugin*`).
+pub const PROTOCOL_VERSION: u32 = 4;
 /// Versión más antigua con la que se sigue hablando (sin audio). Un host acepta cualquier visor
 /// entre esta y `PROTOCOL_VERSION`; un visor nuevo que choca con un host antiguo reintenta con esta.
 pub const MIN_PROTOCOL_VERSION: u32 = 2;
 /// Primera versión con audio: solo se envían mensajes de audio si ambos lados la alcanzan.
 pub const AUDIO_PROTOCOL_VERSION: u32 = 3;
+/// Primera versión con complementos (IGP_Soft): solo se ofrecen si ambos lados la alcanzan.
+pub const PLUGIN_PROTOCOL_VERSION: u32 = 4;
+/// Motivos de `PluginError`.
+pub const PLUGIN_NOT_INSTALLED: &str = "no_instalado";
+pub const PLUGIN_NOT_RESPONDING: &str = "no_responde";
+pub const PLUGIN_ACCESS_DENIED: &str = "acceso_denegado";
+pub const PLUGIN_NOT_ALLOWED: &str = "no_permitido";
+pub const PLUGIN_UNKNOWN: &str = "desconocido";
 /// Motivo exacto con el que un host rechaza una versión que no admite (los hosts antiguos ya lo
 /// usaban): el visor lo reconoce para reintentar con `MIN_PROTOCOL_VERSION`.
 pub const REJECT_VERSION: &str = "Versión de LCVDesk incompatible";
@@ -76,6 +84,33 @@ pub enum Message {
     PreviewRequest { index: u32 },
     /// Host → visor: miniatura de un monitor.
     Preview(DisplayPreview),
+
+    // --- Desde la versión 4: túnel de complementos. LCVDesk no interpreta su contenido. ---
+    /// Visor → host: ¿qué complementos tienes instalados?
+    PluginQuery,
+    /// Host → visor: complementos del host (`version` vacía si no está instalado).
+    PluginList { items: Vec<PluginInfo> },
+    /// Visor → host: abrir el lado controlado del complemento `id` en el canal `channel`.
+    PluginOpen { id: String, channel: u32 },
+    /// Host → visor: el complemento está conectado; ya pueden fluir datos por el canal.
+    PluginOpened { channel: u32 },
+    /// Host → visor: no se pudo abrir (`PLUGIN_NOT_INSTALLED`, `PLUGIN_NOT_RESPONDING`…).
+    PluginError { channel: u32, reason: String },
+    /// Bytes de la tubería del complemento, copiados tal cual y en orden (en ambos sentidos).
+    PluginData {
+        channel: u32,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
+    /// Un lado cerró su tubería: el otro cierra la suya (en ambos sentidos).
+    PluginClose { channel: u32 },
+}
+
+/// Un complemento y su versión instalada en un equipo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInfo {
+    pub id: String,
+    pub version: String,
 }
 
 /// Miniatura de un monitor del host (≤ 240×180), en RGBA de 8 bits.
@@ -212,6 +247,31 @@ mod tests {
         assert_eq!(postcard::to_allocvec(&Message::RequestKeyframe).unwrap(), [8]);
         assert_eq!(postcard::to_allocvec(&Message::ReleaseAll).unwrap(), [16]);
         assert_eq!(postcard::to_allocvec(&Message::AudioEnable { on: true }).unwrap(), [18, 1]);
+        assert_eq!(postcard::to_allocvec(&Message::Preview(DisplayPreview { index: 0, width: 0, height: 0, rgba: vec![] })).unwrap()[0], 20);
+        assert_eq!(postcard::to_allocvec(&Message::PluginQuery).unwrap(), [21]);
+        assert_eq!(postcard::to_allocvec(&Message::PluginClose { channel: 1 }).unwrap(), [27, 1]);
+    }
+
+    #[test]
+    fn plugin_roundtrip() {
+        let msgs = [
+            Message::PluginQuery,
+            Message::PluginList { items: vec![PluginInfo { id: "igp_soft".into(), version: "1.0.2-exp.2".into() }] },
+            Message::PluginOpen { id: "igp_soft".into(), channel: 7 },
+            Message::PluginOpened { channel: 7 },
+            Message::PluginError { channel: 7, reason: PLUGIN_NOT_RESPONDING.into() },
+            Message::PluginData { channel: 7, data: b"{\"tipo\":\"latido\"}
+".to_vec() },
+            Message::PluginClose { channel: 7 },
+        ];
+        let mut wire = Vec::new();
+        for m in &msgs {
+            write_message(&mut wire, m).unwrap();
+        }
+        let mut cursor = io::Cursor::new(wire);
+        for m in &msgs {
+            assert_eq!(&read_message(&mut cursor).unwrap(), m);
+        }
     }
 
     #[test]

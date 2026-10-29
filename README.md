@@ -31,7 +31,7 @@ Objetivo: latencia mínima (15–30 ms extremo a extremo en LAN gigabit).
 | 4.4 Cifrado y aceptación | Pendiente |
 | 4.5 Portapapeles y archivos | Pendiente |
 | Actualización por GitHub (updater) | Implementada — requiere fijar el repositorio |
-| Complemento IGP_Soft (gestión de ventanas en remoto) | Diseñado, pendiente de implementar |
+| Complemento IGP_Soft (manejar las pantallas del remoto desde IGP_Soft) | Implementado (0.4.0-beta.1) — en pruebas ([docs/IGP_SOFT.md](docs/IGP_SOFT.md)) |
 
 ## Requisitos de compilación
 

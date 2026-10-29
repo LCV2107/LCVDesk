@@ -4,10 +4,11 @@ use crate::discovery::Discovery;
 use crate::host::Host;
 use crate::keyhook;
 use crate::keymap;
+use crate::plugins::{self, IGP_SOFT};
 use crate::recents::{self, SavedDevice};
 use crate::uac;
 use crate::updater::{self, Updater};
-use crate::viewer::{Status, Viewer};
+use crate::viewer::{PluginState, Status, Viewer};
 use eframe::egui::{
     self, Color32, ColorImage, CornerRadius, Event, Frame, Key, Modifiers, PointerButton, Rect,
     RichText, Sense, Stroke, TextureHandle, TextureOptions, ThemePreference, pos2,
@@ -126,6 +127,9 @@ struct App {
     sent_mods: Modifiers,
     /// Última posición del ratón enviada (para no repetir).
     last_mouse: Option<(u16, u16)>,
+    /// Botones cuya pulsación se envió al remoto: su liberación se envía siempre, aunque el puntero
+    /// ya no esté sobre la imagen (si no, el botón quedaría pulsado allí).
+    remote_buttons: Vec<MouseButton>,
     /// El control remoto está activo (la vista tiene el foco).
     controlling: bool,
     /// Captura de teclado activa: todas las teclas (Windows, Alt+Tab…) van al equipo remoto.
@@ -136,6 +140,11 @@ struct App {
     channel: Channel,
     /// El usuario ocultó el aviso de actualización (no crítica) en esta sesión.
     update_dismissed: bool,
+    /// Permitir que quien controla este equipo abra complementos (persistido).
+    plugins_allowed: bool,
+    /// IGP_Soft en este equipo, releído del registro cada pocos segundos.
+    igp_local: Option<plugins::Installed>,
+    igp_checked: Option<std::time::Instant>,
 }
 
 impl App {
@@ -162,12 +171,25 @@ impl App {
             update_checked: false,
             sent_mods: Modifiers::default(),
             last_mouse: None,
+            remote_buttons: Vec::new(),
             controlling: false,
             capture: true,
             theme: Theme::from_str(&crate::settings::load_theme()),
             channel: Channel::from_str(&crate::settings::load_channel()),
             update_dismissed: false,
+            plugins_allowed: crate::settings::load_plugins_allowed(),
+            igp_local: None,
+            igp_checked: None,
         }
+    }
+
+    /// IGP_Soft instalado en este equipo (se relee del registro como mucho cada 3 s).
+    fn igp_local(&mut self) -> Option<plugins::Installed> {
+        if self.igp_checked.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
+            self.igp_local = plugins::detect(IGP_SOFT);
+            self.igp_checked = Some(std::time::Instant::now());
+        }
+        self.igp_local.clone()
     }
 
     /// Busca actualizaciones según el canal. En Estable con una beta instalada, ofrece volver a la
@@ -290,6 +312,8 @@ impl App {
             self.access_password_section(ui);
             ui.add_space(10.0);
             self.uac_section(ui);
+            ui.add_space(10.0);
+            self.plugins_section(ui);
             ui.add_space(10.0);
             self.updates_section(ui);
         });
@@ -606,6 +630,34 @@ impl App {
         }
     }
 
+    /// Ajustes → Complementos: qué hay instalado aquí y si se permite usarlos desde otro equipo.
+    fn plugins_section(&mut self, ui: &mut egui::Ui) {
+        section_header(ui, "Complementos");
+        ui.add_space(4.0);
+        match self.igp_local() {
+            Some(igp) => {
+                ui.label(format!("IGP_Soft {}", igp.version));
+                ui.label(RichText::new(igp.exe.display().to_string()).small().color(Color32::GRAY));
+            }
+            None => {
+                ui.label(RichText::new("IGP_Soft no está instalado en este equipo.").color(Color32::GRAY));
+                ui.hyperlink_to("Descargar IGP_Soft", plugins::IGP_SOFT_DOWNLOAD);
+            }
+        }
+        ui.add_space(4.0);
+        if ui.checkbox(&mut self.plugins_allowed, "Permitir que me controlen con complementos").changed() {
+            crate::settings::save_plugins_allowed(self.plugins_allowed);
+        }
+        ui.label(
+            RichText::new(
+                "Quien te controla puede abrir IGP_Soft y manejar desde su equipo las pantallas de este. \
+                 Mientras tanto, tu IGP_Soft queda bloqueado con un aviso.",
+            )
+            .small()
+            .color(Color32::GRAY),
+        );
+    }
+
     fn uac_section(&mut self, ui: &mut egui::Ui) {
         section_header(ui, "UAC en remoto");
         ui.add_space(4.0);
@@ -662,6 +714,7 @@ impl App {
             self.last_close_reason = status_text;
             self.viewer = None;
             self.controlling = false;
+            self.remote_buttons.clear();
             keyhook::set_grab(false);
             return;
         }
@@ -699,6 +752,7 @@ impl App {
             }
         }
 
+        let igp_local = self.igp_local();
         let mut toggle_capture = false;
         ui.horizontal(|ui| {
             let viewer = self.viewer.as_ref().unwrap();
@@ -737,6 +791,7 @@ impl App {
                         viewer.set_audio(!on);
                     }
                 }
+                plugins_button(ui, viewer, igp_local.as_ref());
             }
             // Monitores del equipo remoto como botones 1 2 3… con vista previa al pasar el cursor
             // (solo si tiene más de uno). Especificación: replica/design/components.md.
@@ -856,7 +911,9 @@ impl App {
     /// incluida Windows/Alt+Tab, van al remoto); el hook solo suprime cuando la ventana es nuestra.
     /// El ratón se reenvía siempre que el puntero esté sobre la imagen. Ctrl+Alt+Inicio suelta.
     fn handle_control(&mut self, ui: &egui::Ui, response: &egui::Response, image_rect: Option<Rect>) {
-        let _ = response;
+        // El ratón solo va al remoto si el puntero está sobre la imagen y no sobre algo encima de
+        // ella (el menú de complementos, la vista previa de un monitor…).
+        let over_image = response.contains_pointer();
         let Some(viewer) = self.viewer.as_ref() else { return };
         let Some(rect) = image_rect else {
             keyhook::set_grab(false);
@@ -878,7 +935,7 @@ impl App {
 
         // --- Ratón: posición normalizada 0..=65535 sobre la imagen remota. ---
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-            if rect.contains(pos) {
+            if over_image && rect.contains(pos) {
                 let nx = ((pos.x - rect.min.x) / rect.width() * 65535.0).clamp(0.0, 65535.0) as u16;
                 let ny = ((pos.y - rect.min.y) / rect.height() * 65535.0).clamp(0.0, 65535.0) as u16;
                 if self.last_mouse != Some((nx, ny)) {
@@ -914,12 +971,17 @@ impl App {
         }
         for event in &events {
             match event {
-                Event::PointerButton { button, pressed, pos, .. } if rect.contains(*pos) => {
-                    if let Some(b) = map_button(*button) {
-                        viewer.send(&Message::MouseButton { button: b, down: *pressed });
+                Event::PointerButton { button, pressed, pos, .. } => {
+                    let Some(b) = map_button(*button) else { continue };
+                    if *pressed && over_image && rect.contains(*pos) {
+                        viewer.send(&Message::MouseButton { button: b, down: true });
+                        self.remote_buttons.push(b);
+                    } else if !*pressed && self.remote_buttons.contains(&b) {
+                        viewer.send(&Message::MouseButton { button: b, down: false });
+                        self.remote_buttons.retain(|x| *x != b);
                     }
                 }
-                Event::MouseWheel { delta, .. } => {
+                Event::MouseWheel { delta, .. } if over_image => {
                     // Una muesca de rueda = 120; el delta de egui viene en líneas/puntos.
                     let dy = (delta.y * 120.0).round() as i32;
                     let dx = (delta.x * 120.0).round() as i32;
@@ -1005,6 +1067,100 @@ fn tune_style(s: &mut egui::Style, dark: bool) {
     s.spacing.button_padding = egui::vec2(12.0, 7.0);
     // Las ayudas (y la vista previa de monitores) aparecen antes: 250 ms en vez de 500.
     s.interaction.tooltip_delay = 0.25;
+}
+
+/// Botón «Complementos» de la barra de la sesión. Su texto refleja el estado de IGP_Soft y su menú
+/// muestra las versiones de los dos equipos y permite abrirlo o cerrarlo.
+fn plugins_button(ui: &mut egui::Ui, viewer: &Viewer, local: Option<&plugins::Installed>) {
+    let (supported, state) = {
+        let sh = viewer.shared();
+        (sh.plugin_supported, sh.plugin_state.get(IGP_SOFT).cloned())
+    };
+    if !supported {
+        ui.add_enabled(false, egui::Button::new("🔌 Complementos"))
+            .on_disabled_hover_text("El equipo remoto tiene una versión de LCVDesk sin complementos: actualízalo.");
+        return;
+    }
+    let title = match &state {
+        Some(PluginState::Opening | PluginState::Launching) => RichText::new("🔌 Abriendo IGP_Soft…").color(ORANGE),
+        Some(PluginState::Open) => RichText::new("🔌 IGP_Soft conectado").color(GREEN),
+        Some(PluginState::Error(_)) => RichText::new("🔌 Complementos ⚠").color(ORANGE),
+        None => RichText::new("🔌 Complementos"),
+    };
+    ui.menu_button(title, |ui| plugins_menu(ui, viewer, local, state));
+}
+
+fn plugins_menu(ui: &mut egui::Ui, viewer: &Viewer, local: Option<&plugins::Installed>, state: Option<PluginState>) {
+    ui.set_min_width(320.0);
+    let remote = viewer.shared().remote_plugins.as_ref().map(|items| {
+        items.iter().find(|p| p.id == IGP_SOFT).map(|p| p.version.clone()).unwrap_or_default()
+    });
+    ui.label(RichText::new("IGP_Soft").strong());
+    ui.label(RichText::new("Maneja las pantallas del equipo remoto desde tu IGP_Soft.").small().color(Color32::GRAY));
+    ui.add_space(4.0);
+    let missing = |v: Option<&str>| match v {
+        Some(v) if !v.is_empty() => RichText::new(v.to_string()),
+        Some(_) => RichText::new("no instalado").color(ORANGE),
+        None => RichText::new("consultando…").color(Color32::GRAY),
+    };
+    egui::Grid::new("plugin-versions").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+        ui.label("Este equipo");
+        ui.label(missing(Some(local.map_or("", |l| l.version.as_str()))));
+        ui.end_row();
+        ui.label("Equipo remoto");
+        ui.label(missing(remote.as_deref()));
+        ui.end_row();
+    });
+    ui.add_space(6.0);
+
+    match &state {
+        Some(PluginState::Opening) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Abriendo IGP_Soft en el equipo remoto…");
+            });
+            return;
+        }
+        Some(PluginState::Launching) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Abriendo IGP_Soft en este equipo…");
+            });
+            return;
+        }
+        Some(PluginState::Open) => {
+            ui.colored_label(GREEN, "● Conectado: usa la ventana de IGP_Soft «Controlando…».");
+            if ui.button("Cerrar IGP_Soft remoto").clicked() {
+                viewer.close_plugin(IGP_SOFT);
+            }
+            return;
+        }
+        Some(PluginState::Error(text)) => {
+            ui.colored_label(RED, text);
+            ui.add_space(4.0);
+        }
+        None => {}
+    }
+
+    // Comprobaciones antes de abrir (contrato: los dos equipos con la misma versión).
+    let local_version = local.map(|l| l.version.as_str()).unwrap_or("");
+    let problem = match remote.as_deref() {
+        _ if local.is_none() => Some("Instala IGP_Soft en este equipo.".to_string()),
+        None => None,
+        Some("") => Some("Instala IGP_Soft en el equipo remoto.".to_string()),
+        Some(r) if !plugins::same_version(local_version, r) => Some(format!(
+            "Las versiones no coinciden (aquí {local_version}, allí {r}). Instala la misma versión en los dos equipos."
+        )),
+        Some(_) => None,
+    };
+    if let Some(p) = &problem {
+        ui.colored_label(ORANGE, p);
+        ui.hyperlink_to("Descargar IGP_Soft", plugins::IGP_SOFT_DOWNLOAD);
+    }
+    let ready = problem.is_none() && remote.is_some();
+    if ui.add_enabled(ready, egui::Button::new("Abrir IGP_Soft")).clicked() {
+        viewer.open_plugin(IGP_SOFT);
+    }
 }
 
 fn section_header(ui: &mut egui::Ui, text: &str) {

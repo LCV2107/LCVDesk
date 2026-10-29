@@ -1,4 +1,4 @@
-//! Preferencias ligeras de la interfaz (por ahora, solo el tema) en `%LOCALAPPDATA%\LCVDesk\theme`.
+//! Preferencias ligeras (tema, canal, sonido, complementos): un archivo por ajuste en `%LOCALAPPDATA%\LCVDesk`.
 
 use std::path::PathBuf;
 
@@ -47,4 +47,13 @@ fn write_file(name: &str, value: &str) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(path, value);
+}
+
+/// ¿Permitir que quien controla este equipo abra complementos (IGP_Soft)? Activado por defecto.
+pub fn load_plugins_allowed() -> bool {
+    std::fs::read_to_string(file_in_dir("plugins")).map(|s| s.trim() != "off").unwrap_or(true)
+}
+
+pub fn save_plugins_allowed(on: bool) {
+    write_file("plugins", if on { "on" } else { "off" });
 }

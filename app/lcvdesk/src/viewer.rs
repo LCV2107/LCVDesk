@@ -2,12 +2,15 @@
 
 use eframe::egui;
 use lcv_codec::H264Decoder;
+use crate::plugins::{self, Channel};
 use lcv_proto::{
-    AUDIO_PROTOCOL_VERSION, DEFAULT_PORT, DisplayInfo, MIN_PROTOCOL_VERSION, Message, PROTOCOL_VERSION, REJECT_VERSION,
+    AUDIO_PROTOCOL_VERSION, DEFAULT_PORT, DisplayInfo, MIN_PROTOCOL_VERSION, Message, PLUGIN_ACCESS_DENIED, PLUGIN_NOT_ALLOWED,
+    PLUGIN_NOT_INSTALLED, PLUGIN_NOT_RESPONDING, PLUGIN_PROTOCOL_VERSION, PROTOCOL_VERSION, PluginInfo, REJECT_VERSION,
     read_message, write_message,
 };
+use std::collections::HashMap;
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,6 +23,17 @@ pub enum Status {
     WaitingAcceptance,
     Streaming,
     Closed(String),
+}
+
+/// Estado de un complemento en esta sesión (sin entrada = cerrado).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginState {
+    /// Esperando a que el equipo remoto abra su lado.
+    Opening,
+    /// El remoto está listo; abriendo el panel en este equipo.
+    Launching,
+    Open,
+    Error(String),
 }
 
 pub struct RgbaFrame {
@@ -53,7 +67,15 @@ pub struct Shared {
     pub audio_supported: bool,
     /// Miniaturas de monitores recién llegadas; la interfaz las recoge y las convierte en texturas.
     pub previews: Vec<lcv_proto::DisplayPreview>,
+    /// El host habla una versión con complementos (v4).
+    pub plugin_supported: bool,
+    /// Complementos instalados en el equipo remoto (llega tras aceptar la conexión).
+    pub remote_plugins: Option<Vec<PluginInfo>>,
+    /// Estado de cada complemento por id.
+    pub plugin_state: HashMap<String, PluginState>,
 }
+
+type Channels = Arc<Mutex<HashMap<u32, Arc<Channel>>>>;
 
 pub struct Viewer {
     pub target: String,
@@ -71,6 +93,10 @@ pub struct Viewer {
     audio_on: Arc<AtomicBool>,
     /// Última petición de miniatura por monitor (para no pedirlas en cada fotograma).
     preview_asked: Mutex<std::collections::HashMap<u32, Instant>>,
+    /// Complementos abiertos, por canal.
+    channels: Channels,
+    next_channel: AtomicU32,
+    ctx: egui::Context,
 }
 
 impl Viewer {
@@ -85,7 +111,11 @@ impl Viewer {
             host_name: String::new(),
             audio_supported: false,
             previews: Vec::new(),
+            plugin_supported: false,
+            remote_plugins: None,
+            plugin_state: HashMap::new(),
         }));
+        let channels: Channels = Default::default();
         let stop = Arc::new(AtomicBool::new(false));
         let audio_on = Arc::new(AtomicBool::new(crate::settings::load_audio()));
         let writer = Arc::new(Mutex::new(None));
@@ -125,11 +155,18 @@ impl Viewer {
 
         let (pw_tx, pw_rx) = std::sync::mpsc::channel::<Option<(String, bool)>>();
 
-        let (sh, st, wr, t, au) = (shared.clone(), stop.clone(), writer.clone(), target.clone(), audio_on.clone());
+        let (sh, st, wr, t, au, chs) =
+            (shared.clone(), stop.clone(), writer.clone(), target.clone(), audio_on.clone(), channels.clone());
+        let ui_ctx = ctx.clone();
         thread::Builder::new()
             .name("viewer".into())
             .spawn(move || {
-                let result = run(&t, initial_password, pw_rx, &sh, &st, &wr, &au, &ctx);
+                let result = run(&t, initial_password, pw_rx, &sh, &st, &wr, &au, &chs, &ctx);
+                // Sin sesión no hay túnel: se cierran las tuberías (el panel del complemento lo nota).
+                for (_, ch) in lock(&chs).drain() {
+                    ch.close();
+                }
+                lock(&sh).plugin_state.clear();
                 let reason = match result {
                     _ if st.load(Ordering::Relaxed) => "Desconectado".to_string(),
                     Ok(reason) => reason,
@@ -150,7 +187,39 @@ impl Viewer {
             key_owner,
             audio_on,
             preview_asked: Mutex::new(Default::default()),
+            channels,
+            next_channel: AtomicU32::new(1),
+            ctx: ui_ctx,
         }
+    }
+
+    /// Abre un complemento: primero su lado en el equipo remoto (`PluginOpen`); cuando confirma, el
+    /// panel en este equipo (ver `launch_local_panel`).
+    pub fn open_plugin(&self, id: &str) {
+        {
+            let mut sh = self.shared();
+            if matches!(sh.plugin_state.get(id), Some(PluginState::Opening | PluginState::Launching | PluginState::Open)) {
+                return;
+            }
+            sh.plugin_state.insert(id.into(), PluginState::Opening);
+        }
+        let channel = self.next_channel.fetch_add(1, Ordering::Relaxed);
+        lock(&self.channels).insert(channel, Channel::new(channel, id));
+        info!("complemento {id}: pidiendo al equipo remoto que lo abra (canal {channel})");
+        self.send(&Message::PluginOpen { id: id.into(), channel });
+    }
+
+    /// Cierra el complemento en los dos equipos.
+    pub fn close_plugin(&self, id: &str) {
+        let ids: Vec<u32> = lock(&self.channels).iter().filter(|(_, c)| c.plugin == id).map(|(k, _)| *k).collect();
+        for channel in ids {
+            if let Some(ch) = lock(&self.channels).remove(&channel) {
+                ch.close();
+                self.send(&Message::PluginClose { channel });
+            }
+        }
+        self.shared().plugin_state.remove(id);
+        self.ctx.request_repaint();
     }
 
     /// Pide al host una miniatura del monitor `index`, como mucho una vez cada 1,5 s por monitor
@@ -211,6 +280,9 @@ impl Viewer {
 
     pub fn disconnect(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        for (_, ch) in lock(&self.channels).drain() {
+            ch.close();
+        }
         crate::keyhook::clear_sink(self.key_owner);
         if let Some(s) = lock(&self.writer).as_ref() {
             let _ = s.shutdown(Shutdown::Both);
@@ -233,10 +305,11 @@ fn run(
     target: &str,
     initial_password: Option<String>,
     pw_rx: std::sync::mpsc::Receiver<Option<(String, bool)>>,
-    shared: &Mutex<Shared>,
+    shared: &Arc<Mutex<Shared>>,
     stop: &Arc<AtomicBool>,
     writer: &Arc<Mutex<Option<TcpStream>>>,
     audio_on: &AtomicBool,
+    channels: &Channels,
     ctx: &egui::Context,
 ) -> std::io::Result<String> {
     let target = if target.contains(':') { target.to_string() } else { format!("{target}:{DEFAULT_PORT}") };
@@ -322,7 +395,13 @@ fn run(
                 sh.host_id = host_id;
                 sh.host_name = host_name;
                 sh.audio_supported = version >= AUDIO_PROTOCOL_VERSION;
+                sh.plugin_supported = version >= PLUGIN_PROTOCOL_VERSION;
                 drop(sh);
+                if version >= PLUGIN_PROTOCOL_VERSION
+                    && let Some(s) = lock(writer).as_mut()
+                {
+                    write_message(s, &Message::PluginQuery)?;
+                }
                 if version >= AUDIO_PROTOCOL_VERSION {
                     let on = audio_on.load(Ordering::Relaxed);
                     info!("el host admite audio ({})", if on { "activado" } else { "silenciado" });
@@ -340,11 +419,11 @@ fn run(
                 sh.displays = displays;
                 sh.current_display = current;
             }
-            // Host antiguo que no conoce esta versión: se reintenta con la mínima (sin audio). El
+            // Host antiguo que no conoce esta versión: se reintenta con la anterior (4 → 3 → 2). El
             // rechazo por versión llega antes de pedir contraseña o aceptación, así que no se repiten.
             Message::Rejected { reason } if reason == REJECT_VERSION && version > MIN_PROTOCOL_VERSION => {
-                info!("el host no admite la versión {version} del protocolo; reintentando con la {MIN_PROTOCOL_VERSION}");
-                version = MIN_PROTOCOL_VERSION;
+                info!("el host no admite la versión {version} del protocolo; reintentando con la {}", version - 1);
+                version -= 1;
                 stream = open(&addr, version, writer)?;
             }
             Message::Rejected { reason } => return Ok(reason),
@@ -361,6 +440,47 @@ fn run(
                     player.get_or_insert_with(lcv_audio::Player::start).push(chunk);
                 } else {
                     player = None;
+                }
+            }
+            Message::PluginList { items } => {
+                info!("complementos del equipo remoto: {items:?}");
+                lock(shared).remote_plugins = Some(items);
+                ctx.request_repaint();
+            }
+            Message::PluginOpened { channel } => {
+                let ch = lock(channels).get(&channel).cloned();
+                match ch {
+                    Some(ch) => {
+                        info!("complemento {}: abierto en el equipo remoto (canal {channel})", ch.plugin);
+                        launch_local_panel(ch, shared.clone(), channels.clone(), writer.clone(), ctx.clone());
+                    }
+                    // Se cerró aquí mientras el remoto lo abría: que lo cierre también.
+                    None => {
+                        if let Some(s) = lock(writer).as_mut() {
+                            write_message(s, &Message::PluginClose { channel })?;
+                        }
+                    }
+                }
+            }
+            Message::PluginError { channel, reason } => {
+                if let Some(ch) = lock(channels).remove(&channel) {
+                    warn!("complemento {}: el equipo remoto no lo pudo abrir ({reason})", ch.plugin);
+                    ch.close();
+                    lock(shared).plugin_state.insert(ch.plugin.clone(), PluginState::Error(remote_error_text(&reason)));
+                    ctx.request_repaint();
+                }
+            }
+            Message::PluginData { channel, data } => {
+                if let Some(ch) = lock(channels).get(&channel) {
+                    ch.push(data);
+                }
+            }
+            Message::PluginClose { channel } => {
+                if let Some(ch) = lock(channels).remove(&channel) {
+                    info!("complemento {}: el equipo remoto lo cerró (canal {channel})", ch.plugin);
+                    ch.close();
+                    lock(shared).plugin_state.remove(&ch.plugin);
+                    ctx.request_repaint();
                 }
             }
             Message::Pong { t_us } => {
@@ -400,6 +520,90 @@ fn run(
             _ => {}
         }
     }
+}
+
+/// Texto para el usuario de un `PluginError` del equipo remoto.
+fn remote_error_text(reason: &str) -> String {
+    match reason {
+        PLUGIN_NOT_INSTALLED => "IGP_Soft no está instalado en el equipo remoto.".into(),
+        PLUGIN_NOT_RESPONDING => "IGP_Soft no respondió en el equipo remoto (10 s).".into(),
+        PLUGIN_ACCESS_DENIED => {
+            "El equipo remoto rechazó la conexión con IGP_Soft. ¿Se está ejecutando como administrador? \
+             Ábrelo sin elevar, igual que LCVDesk."
+                .into()
+        }
+        PLUGIN_NOT_ALLOWED => "El equipo remoto tiene los complementos desactivados en Ajustes.".into(),
+        other => format!("El equipo remoto no pudo abrir el complemento ({other})."),
+    }
+}
+
+/// El equipo remoto ya abrió su lado: crea la tubería local, abre el panel de IGP_Soft en modo
+/// remoto apuntando a ella y, cuando se conecta, empieza a copiar en los dos sentidos.
+fn launch_local_panel(
+    ch: Arc<Channel>,
+    shared: Arc<Mutex<Shared>>,
+    channels: Channels,
+    writer: Arc<Mutex<Option<TcpStream>>>,
+    ctx: egui::Context,
+) {
+    thread::Builder::new()
+        .name("viewer-plugin-open".into())
+        .spawn(move || {
+            let plugin = ch.plugin.clone();
+            let set = |state: Option<PluginState>| {
+                let mut sh = lock(&shared);
+                match state {
+                    Some(s) => sh.plugin_state.insert(plugin.clone(), s),
+                    None => sh.plugin_state.remove(&plugin),
+                };
+                drop(sh);
+                ctx.request_repaint();
+            };
+            let send = {
+                let writer = writer.clone();
+                move |m: Message| lock(&writer).as_mut().is_some_and(|s| write_message(s, &m).is_ok())
+            };
+            let abort = |text: String| {
+                warn!("complemento {plugin}: {text}");
+                if lock(&channels).remove(&ch.id).is_some() {
+                    ch.close();
+                    send(Message::PluginClose { channel: ch.id });
+                }
+                set(Some(PluginState::Error(text)));
+            };
+            set(Some(PluginState::Launching));
+            let Some(local) = plugins::detect(&plugin) else {
+                return abort("IGP_Soft no está instalado en este equipo.".into());
+            };
+            let name = plugins::random_pipe_name();
+            let pipe = match plugins::Pipe::create_server(&name) {
+                Ok(p) => p,
+                Err(e) => return abort(format!("No se pudo preparar la conexión local ({e}).")),
+            };
+            if let Err(e) = plugins::launch(&local.exe, &["--remoto".into(), format!("--tubo={name}")]) {
+                return abort(format!("No se pudo abrir IGP_Soft ({e})."));
+            }
+            if let Err(e) = pipe.accept(plugins::CONNECT_TIMEOUT, ch.cancel_flag()) {
+                if ch.is_closed() {
+                    return; // Se cerró a mano o terminó la sesión mientras tanto.
+                }
+                return abort(format!("IGP_Soft no se conectó en 10 s ({e})."));
+            }
+            info!("complemento {plugin} (canal {}): panel remoto conectado a {name}", ch.id);
+            set(Some(PluginState::Open));
+            let (chs, sh, ctx2, id, plugin2) = (channels.clone(), shared.clone(), ctx.clone(), ch.id, plugin.clone());
+            ch.start(pipe, send, move || {
+                // El panel se cerró (o se cortó el túnel): vuelve a quedar disponible.
+                lock(&chs).remove(&id);
+                let mut sh = lock(&sh);
+                if sh.plugin_state.get(&plugin2) == Some(&PluginState::Open) {
+                    sh.plugin_state.remove(&plugin2);
+                }
+                drop(sh);
+                ctx2.request_repaint();
+            });
+        })
+        .ok();
 }
 
 /// Abre la conexión TCP, la deja como punto de escritura y saluda con `version`.
