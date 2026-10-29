@@ -32,7 +32,10 @@ fn main() -> anyhow::Result<()> {
     // Instancia única: si LCVDesk ya está abierto (p. ej. tras un relanzado por actualización o un
     // doble clic), la segunda copia trae al frente la ventana existente y sale, en vez de pelearse
     // por los puertos 47070/47071 y fallar con el error 10048. Comportamiento tipo AnyDesk.
-    if already_running() {
+    // Solo en compilaciones de desarrollo: permite abrir una segunda copia (con otro LCVDESK_PORT)
+    // junto al LCVDesk instalado, para probar la interfaz sin cerrarlo.
+    let dev_multi = cfg!(debug_assertions) && std::env::var_os("LCVDESK_DEV_MULTI").is_some();
+    if !dev_multi && already_running() {
         tracing::info!("ya hay una instancia en marcha; traigo su ventana al frente y salgo");
         focus_existing_window();
         return Ok(());

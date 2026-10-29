@@ -72,6 +72,24 @@ impl Channel {
 }
 
 /// Verde "conectado", gris "desconectado", naranja "ocupado", rojo "controlando".
+/// Páginas de la pantalla de inicio (barra de navegación). Diseño: replica/design/components.md.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Connect,
+    ThisPc,
+    Plugins,
+    Settings,
+}
+
+impl Page {
+    const ALL: [(Page, &'static str, &'static str); 4] = [
+        (Page::Connect, "🖥", "Conectar"),
+        (Page::ThisPc, "🛡", "Este equipo"),
+        (Page::Plugins, "🔌", "Complementos"),
+        (Page::Settings, "⚙", "Ajustes"),
+    ];
+}
+
 const GREEN: Color32 = Color32::from_rgb(46, 170, 90);
 const ORANGE: Color32 = Color32::from_rgb(210, 150, 50);
 const RED: Color32 = Color32::from_rgb(214, 78, 70);
@@ -140,6 +158,8 @@ struct App {
     channel: Channel,
     /// El usuario ocultó el aviso de actualización (no crítica) en esta sesión.
     update_dismissed: bool,
+    /// Página de la pantalla de inicio que se está viendo.
+    page: Page,
     /// Permitir que quien controla este equipo abra complementos (persistido).
     plugins_allowed: bool,
     /// IGP_Soft en este equipo, releído del registro cada pocos segundos.
@@ -177,6 +197,7 @@ impl App {
             theme: Theme::from_str(&crate::settings::load_theme()),
             channel: Channel::from_str(&crate::settings::load_channel()),
             update_dismissed: false,
+            page: Page::Connect,
             plugins_allowed: crate::settings::load_plugins_allowed(),
             igp_local: None,
             igp_checked: None,
@@ -254,33 +275,151 @@ impl App {
         });
     }
 
-    /// Barra lateral: identidad de este equipo y ajustes.
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
-        ui.label(RichText::new("LCVDesk").strong().size(22.0).color(Self::accent(ui)));
-        ui.label(RichText::new(format!("v{}", updater::current_version())).small().color(Color32::GRAY));
-        ui.add_space(14.0);
-
-        ui.label(RichText::new("ESTE EQUIPO").small().strong().color(Color32::GRAY));
-        ui.add_space(4.0);
-        let port = self.host.state().port;
-        Frame::group(ui.style()).corner_radius(10).inner_margin(12).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(&self.local_name).strong().size(16.0));
-            ui.add_space(2.0);
-            ui.label(RichText::new(format!("{}:{port}", self.local_ip)).monospace());
+    /// Barra de navegación: una entrada por página y, abajo, un resumen de este equipo.
+    fn nav_rail(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
             ui.add_space(8.0);
+            ui.vertical(|ui| {
+                ui.label(RichText::new("LCVDesk").strong().size(22.0).color(pal.accent));
+                ui.label(RichText::new(format!("v{}", updater::current_version())).small().color(pal.text_muted));
+            });
+        });
+        ui.add_space(18.0);
+        let update = self.found_release().is_some();
+        for (page, icon, label) in Page::ALL {
+            let badge = (page == Page::Settings && update).then_some(pal.accent);
+            if nav_item(ui, icon, label, self.page == page, badge, pal).clicked() {
+                self.page = page;
+            }
+            ui.add_space(2.0);
+        }
+
+        // Resumen de este equipo, abajo del todo (≈ 84 px de alto); lleva a su página.
+        ui.add_space((ui.available_height() - 98.0).max(12.0));
+        let visible = self.discovery.is_discoverable();
+        let port = self.host.state().port;
+        let resp = Frame::new()
+            .fill(pal.card_bg)
+            .stroke(Stroke::new(1.0, pal.card_border))
+            .corner_radius(10)
+            .inner_margin(12)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 4.0;
+                ui.label(RichText::new(&self.local_name).strong().color(pal.text_strong));
+                ui.label(RichText::new(format!("{}:{port}", self.local_ip)).monospace().small().color(pal.text_muted));
+                let (txt, col) = if visible { ("● Visible en la red", pal.success_text) } else { ("○ Oculto en la red", pal.text_muted) };
+                ui.label(RichText::new(txt).small().color(col));
+            })
+            .response
+            .interact(Sense::click());
+        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Abrir «Este equipo»").clicked() {
+            self.page = Page::ThisPc;
+        }
+    }
+
+    /// Contenido de la página elegida (con el aviso de actualización arriba, en cualquier página).
+    fn page_area(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        ui.set_max_width(760.0);
+        self.update_banner(ui);
+        ui.add_space(8.0);
+        match self.page {
+            Page::Connect => self.page_connect(ui, pal),
+            Page::ThisPc => self.page_this_pc(ui, pal),
+            Page::Plugins => self.page_plugins(ui, pal),
+            Page::Settings => self.page_settings(ui, pal),
+        }
+    }
+
+    fn page_connect(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        page_header(ui, pal, "Conectar a un equipo", "Escribe su IP o su nombre, o elige uno de tu red o de tus recientes.");
+        let mut connect = false;
+        card(ui, pal, "Conectar por dirección", None, |ui| {
+            ui.horizontal(|ui| {
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.address)
+                        .hint_text("IP o nombre del equipo")
+                        .desired_width(300.0),
+                );
+                connect |= edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                if ui.add(egui::Button::new(RichText::new("Conectar").strong())).clicked() {
+                    connect = true;
+                }
+            });
+            ui.label(RichText::new("Si el equipo tiene contraseña, se te pedirá al conectar.").small().color(pal.text_muted));
+            if let Some(reason) = &self.last_close_reason {
+                ui.add_space(4.0);
+                ui.colored_label(pal.warning_text, reason);
+            }
+        });
+        if connect {
+            let addr = self.address.clone();
+            self.start_connect(addr.clone(), addr, None, ui.ctx());
+        }
+        ui.add_space(8.0);
+        self.devices_section(ui, pal);
+    }
+
+    fn page_this_pc(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        page_header(ui, pal, "Este equipo", "Cómo te encuentran los demás y quién puede controlar este equipo.");
+        let port = self.host.state().port;
+        card(ui, pal, "Identidad", Some("Compártela con quien vaya a conectarse a este equipo."), |ui| {
+            let addr = format!("{}:{port}", self.local_ip);
+            egui::Grid::new("identity").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+                ui.label(RichText::new("Nombre").color(pal.text_muted));
+                ui.label(RichText::new(&self.local_name).strong().color(pal.text_strong));
+                ui.end_row();
+                ui.label(RichText::new("Dirección").color(pal.text_muted));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&addr).monospace().color(pal.text_strong));
+                    if ui.small_button("Copiar").clicked() {
+                        ui.ctx().copy_text(addr.clone());
+                    }
+                });
+                ui.end_row();
+            });
+            ui.add_space(6.0);
             let mut visible = self.discovery.is_discoverable();
             if ui.checkbox(&mut visible, "Visible en la red").changed() {
                 self.discovery.set_discoverable(visible);
             }
+            ui.label(
+                RichText::new("Apareces en «En la red» de los equipos de tu misma red. Desde otras redes, se conectan con tu IP.")
+                    .small()
+                    .color(pal.text_muted),
+            );
         });
+        card(ui, pal, "Acceso por contraseña", None, |ui| self.access_password_section(ui, pal));
+        card(ui, pal, "Avisos de administrador (UAC)", None, |ui| self.uac_section(ui, pal));
+    }
 
-        ui.add_space(14.0);
-        egui::CollapsingHeader::new(RichText::new("⚙  Ajustes").strong()).default_open(false).show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.label(RichText::new("Tema").small().strong().color(Color32::GRAY));
+    fn page_plugins(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        page_header(ui, pal, "Complementos", "Programas que LCVDesk conecta entre los dos equipos durante una sesión.");
+        card(ui, pal, "IGP_Soft", Some("Maneja desde tu IGP_Soft las pantallas del equipo que controlas."), |ui| {
+            self.plugins_section(ui, pal)
+        });
+        card(ui, pal, "Permisos", None, |ui| {
+            if ui.checkbox(&mut self.plugins_allowed, "Permitir que me controlen con complementos").changed() {
+                crate::settings::save_plugins_allowed(self.plugins_allowed);
+            }
+            ui.label(
+                RichText::new(
+                    "Quien te controla puede abrir IGP_Soft y manejar desde su equipo las pantallas de este. \
+                     Mientras tanto, tu IGP_Soft queda bloqueado con un aviso.",
+                )
+                .small()
+                .color(pal.text_muted),
+            );
+        });
+    }
+
+    fn page_settings(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        page_header(ui, pal, "Ajustes", "Preferencias de LCVDesk en este equipo.");
+        card(ui, pal, "Apariencia", None, |ui| {
             ui.horizontal(|ui| {
+                setting_label(ui, pal, "Tema");
+                ui.add_space(8.0);
                 for (label, t) in [("Sistema", Theme::System), ("Claro", Theme::Light), ("Oscuro", Theme::Dark)] {
                     if ui.selectable_label(self.theme == t, label).clicked() {
                         self.theme = t;
@@ -288,10 +427,13 @@ impl App {
                     }
                 }
             });
-            ui.add_space(10.0);
-
-            ui.label(RichText::new("Canal de actualizaciones").small().strong().color(Color32::GRAY));
+        });
+        card(ui, pal, "Actualizaciones", None, |ui| {
+            ui.label(RichText::new(format!("Versión instalada: {}", updater::current_version())).color(pal.text_strong));
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
+                setting_label(ui, pal, "Canal");
+                ui.add_space(8.0);
                 for (label, c) in [("Estable", Channel::Stable), ("Beta", Channel::Beta)] {
                     if ui.selectable_label(self.channel == c, label).clicked() && self.channel != c {
                         self.channel = c;
@@ -305,54 +447,12 @@ impl App {
                 ui.label(
                     RichText::new("Recibes versiones de prueba antes que el resto. Pueden ser inestables.")
                         .small()
-                        .color(ORANGE),
+                        .color(pal.warning_text),
                 );
             }
-            ui.add_space(10.0);
-            self.access_password_section(ui);
-            ui.add_space(10.0);
-            self.uac_section(ui);
-            ui.add_space(10.0);
-            self.plugins_section(ui);
-            ui.add_space(10.0);
-            self.updates_section(ui);
+            ui.add_space(8.0);
+            self.updates_section(ui, pal);
         });
-    }
-
-    /// Área principal cuando no hay sesión: barra de conexión y tarjetas de equipos.
-    fn main_area(&mut self, ui: &mut egui::Ui) {
-        self.update_banner(ui);
-        ui.add_space(16.0);
-        ui.heading("Conectar a un equipo");
-        ui.add_space(8.0);
-        let mut connect = false;
-        ui.horizontal(|ui| {
-            let edit = ui.add(
-                egui::TextEdit::singleline(&mut self.address)
-                    .hint_text("IP o nombre del equipo")
-                    .desired_width(300.0),
-            );
-            connect |= edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            if ui.add(egui::Button::new(RichText::new("Conectar").strong())).clicked() {
-                connect = true;
-            }
-        });
-        ui.label(
-            RichText::new("Si el equipo tiene contraseña, se te pedirá al conectar.")
-                .small()
-                .color(Color32::GRAY),
-        );
-        if connect {
-            let addr = self.address.clone();
-            self.start_connect(addr.clone(), addr, None, ui.ctx());
-        }
-        if let Some(reason) = &self.last_close_reason {
-            ui.add_space(6.0);
-            ui.colored_label(ORANGE, reason);
-        }
-
-        ui.add_space(20.0);
-        self.devices_section(ui);
     }
 
     /// Aviso discreto (no crítico) de actualización disponible, en la parte superior.
@@ -456,18 +556,18 @@ impl App {
     }
 
     /// Tarjetas de equipos encontrados en la red y de equipos recientes.
-    fn devices_section(&mut self, ui: &mut egui::Ui) {
+    fn devices_section(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let found = self.discovery.list();
 
-        section_header(ui, "En la red");
+        section_header(ui, "En la red", pal);
         ui.add_space(6.0);
         if found.is_empty() {
-            ui.label(RichText::new("Buscando equipos con LCVDesk en tu red…").small().color(Color32::GRAY));
+            ui.label(RichText::new("Buscando equipos con LCVDesk en tu red…").small().color(pal.text_muted));
         } else {
             let mut connect = None;
             ui.horizontal_wrapped(|ui| {
                 for f in &found {
-                    let act = device_card(ui, &f.name, &f.addr, true, f.busy, None);
+                    let act = device_card(ui, pal, &f.name, &f.addr, true, f.busy, None);
                     if act.connect {
                         connect = Some((f.addr.clone(), f.name.clone(), Some(f.id.clone())));
                     }
@@ -479,10 +579,10 @@ impl App {
         }
 
         ui.add_space(18.0);
-        section_header(ui, "Recientes");
+        section_header(ui, "Recientes", pal);
         ui.add_space(6.0);
         if self.recents.is_empty() {
-            ui.label(RichText::new("Aún no te has conectado a ningún equipo.").small().color(Color32::GRAY));
+            ui.label(RichText::new("Aún no te has conectado a ningún equipo.").small().color(pal.text_muted));
             return;
         }
         let online: std::collections::HashSet<&str> = found.iter().map(|f| f.id.as_str()).collect();
@@ -490,7 +590,7 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             for d in &self.recents {
                 let on = online.contains(d.id.as_str());
-                let act = device_card(ui, &d.name, &d.addr, on, false, Some(d.favorite));
+                let act = device_card(ui, pal, &d.name, &d.addr, on, false, Some(d.favorite));
                 if act.connect {
                     connect = Some((d.addr.clone(), d.name.clone(), Some(d.id.clone())));
                 }
@@ -518,12 +618,10 @@ impl App {
 
     /// Configura la contraseña de acceso de ESTE equipo (lado controlado). Con contraseña, quien la
     /// sepa entra sin que haya que aceptar manualmente; sin ella (o si falla) se pide aceptación.
-    fn access_password_section(&mut self, ui: &mut egui::Ui) {
-        section_header(ui, "Acceso por contraseña");
-        ui.add_space(4.0);
+    fn access_password_section(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         if self.has_access_password {
             ui.horizontal(|ui| {
-                ui.colored_label(Color32::from_rgb(40, 160, 70), "● Hay una contraseña configurada.");
+                ui.colored_label(pal.success_text, "● Hay una contraseña configurada.");
                 if ui.button("Quitar contraseña").clicked() {
                     crate::auth::clear_password();
                     self.has_access_password = crate::auth::has_password();
@@ -536,7 +634,7 @@ impl App {
                      Si no la introduce o es incorrecta, aún aparecerá la ventana para aceptar.",
                 )
                 .small()
-                .color(Color32::GRAY),
+                .color(pal.text_muted),
             );
         } else {
             ui.label(
@@ -545,7 +643,7 @@ impl App {
                      permitir el acceso sin confirmación en este equipo.",
                 )
                 .small()
-                .color(Color32::GRAY),
+                .color(pal.text_muted),
             );
             ui.horizontal(|ui| {
                 ui.add(
@@ -565,10 +663,8 @@ impl App {
         }
     }
 
-    fn updates_section(&mut self, ui: &mut egui::Ui) {
+    fn updates_section(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         use updater::Status;
-        section_header(ui, "Actualizaciones");
-        ui.add_space(4.0);
         let busy = matches!(&*self.updater.status(), Status::Checking | Status::Downloading(_) | Status::Installing);
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(!busy, egui::Button::new("Buscar actualizaciones")).clicked() {
@@ -597,18 +693,18 @@ impl App {
                 });
             }
             Status::UpToDate => {
-                ui.colored_label(Color32::from_rgb(40, 160, 70), "Estás en la última versión.");
+                ui.colored_label(pal.success_text, "Estás en la última versión.");
             }
             Status::Found(r) if r.downgrade => {
                 ui.colored_label(
-                    Color32::from_rgb(40, 110, 220),
+                    pal.accent,
                     format!("Versión estable disponible: {} (se desinstala la beta y se instala la estable)", r.version),
                 );
             }
             Status::Found(r) => {
-                ui.colored_label(Color32::from_rgb(40, 110, 220), format!("Hay una versión nueva: {}", r.version));
+                ui.colored_label(pal.accent, format!("Hay una versión nueva: {}", r.version));
                 if !r.notes.is_empty() {
-                    ui.label(RichText::new(truncate(&r.notes, 300)).small().color(Color32::GRAY));
+                    ui.label(RichText::new(truncate(&r.notes, 300)).small().color(pal.text_muted));
                 }
                 if !r.page.is_empty() {
                     ui.hyperlink_to("Ver notas en GitHub", &r.page);
@@ -616,7 +712,7 @@ impl App {
             }
             Status::Downloading(pct) => {
                 ui.add(egui::ProgressBar::new(*pct as f32 / 100.0).show_percentage());
-                ui.label(RichText::new("Descargando y verificando…").small().color(Color32::GRAY));
+                ui.label(RichText::new("Descargando y verificando…").small().color(pal.text_muted));
             }
             Status::Installing => {
                 ui.horizontal(|ui| {
@@ -625,45 +721,29 @@ impl App {
                 });
             }
             Status::Error(e) => {
-                ui.colored_label(Color32::from_rgb(210, 90, 60), format!("No se pudo actualizar: {e}"));
+                ui.colored_label(pal.danger_text, format!("No se pudo actualizar: {e}"));
             }
         }
     }
 
     /// Ajustes → Complementos: qué hay instalado aquí y si se permite usarlos desde otro equipo.
-    fn plugins_section(&mut self, ui: &mut egui::Ui) {
-        section_header(ui, "Complementos");
-        ui.add_space(4.0);
+    fn plugins_section(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         match self.igp_local() {
             Some(igp) => {
                 ui.label(format!("IGP_Soft {}", igp.version));
-                ui.label(RichText::new(igp.exe.display().to_string()).small().color(Color32::GRAY));
+                ui.label(RichText::new(igp.exe.display().to_string()).small().color(pal.text_muted));
             }
             None => {
-                ui.label(RichText::new("IGP_Soft no está instalado en este equipo.").color(Color32::GRAY));
+                ui.label(RichText::new("IGP_Soft no está instalado en este equipo.").color(pal.text_muted));
                 ui.hyperlink_to("Descargar IGP_Soft", plugins::IGP_SOFT_DOWNLOAD);
             }
         }
-        ui.add_space(4.0);
-        if ui.checkbox(&mut self.plugins_allowed, "Permitir que me controlen con complementos").changed() {
-            crate::settings::save_plugins_allowed(self.plugins_allowed);
-        }
-        ui.label(
-            RichText::new(
-                "Quien te controla puede abrir IGP_Soft y manejar desde su equipo las pantallas de este. \
-                 Mientras tanto, tu IGP_Soft queda bloqueado con un aviso.",
-            )
-            .small()
-            .color(Color32::GRAY),
-        );
     }
 
-    fn uac_section(&mut self, ui: &mut egui::Ui) {
-        section_header(ui, "UAC en remoto");
-        ui.add_space(4.0);
+    fn uac_section(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         match self.uac_enabled {
             None => {
-                ui.colored_label(Color32::GRAY, "No se pudo leer el estado (permisos insuficientes).");
+                ui.colored_label(pal.text_muted, "No se pudo leer el estado (permisos insuficientes).");
             }
             Some(state) => {
                 let mut on = state;
@@ -678,7 +758,7 @@ impl App {
                          necesites. No afecta a la pantalla de bloqueo. Pedirá confirmación de administrador.",
                     )
                     .small()
-                    .color(Color32::from_rgb(200, 170, 90)),
+                    .color(pal.warning_text),
                 );
                 if resp.changed() {
                     if uac::set(on) {
@@ -1036,12 +1116,16 @@ impl eframe::App for App {
         if self.viewer.is_some() {
             egui::CentralPanel::default().show(ui, |ui| self.remote(ui));
         } else {
-            egui::Panel::left("side").resizable(false).show(ui, |ui| {
-                ui.set_min_width(248.0);
-                egui::ScrollArea::vertical().show(ui, |ui| self.sidebar(ui));
-            });
+            let pal = Palette::of(ui.visuals().dark_mode);
+            egui::Panel::left("side")
+                .resizable(false)
+                .exact_size(208.0)
+                .frame(Frame::new().fill(pal.nav_bg).inner_margin(egui::Margin::symmetric(10, 0)))
+                .show(ui, |ui| self.nav_rail(ui, &pal));
             egui::CentralPanel::default().show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.main_area(ui));
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    Frame::new().inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| self.page_area(ui, &pal));
+                });
             });
         }
     }
@@ -1063,6 +1147,11 @@ fn tune_style(s: &mut egui::Style, dark: bool) {
     s.visuals.widgets.active.corner_radius = cr;
     s.visuals.widgets.open.corner_radius = cr;
     s.visuals.window_corner_radius = CornerRadius::same(10);
+    if !dark {
+        // En claro, los campos de texto (blancos) desaparecían sobre las tarjetas blancas: borde
+        // border-input (3,45:1, el mínimo para un campo es 3:1). En oscuro ya se distinguen por el fondo.
+        s.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_gray(0x8a));
+    }
     s.spacing.item_spacing = egui::vec2(8.0, 8.0);
     s.spacing.button_padding = egui::vec2(12.0, 7.0);
     // Las ayudas (y la vista previa de monitores) aparecen antes: 250 ms en vez de 500.
@@ -1163,8 +1252,74 @@ fn plugins_menu(ui: &mut egui::Ui, viewer: &Viewer, local: Option<&plugins::Inst
     }
 }
 
-fn section_header(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text.to_uppercase()).small().strong().color(Color32::GRAY));
+fn section_header(ui: &mut egui::Ui, text: &str, pal: &Palette) {
+    ui.label(RichText::new(text.to_uppercase()).small().strong().color(pal.text_muted));
+}
+
+/// Etiqueta de una fila de opciones («Tema», «Canal»): ancho fijo y la altura de un botón, para que
+/// quede centrada con los botones que la siguen.
+fn setting_label(ui: &mut egui::Ui, pal: &Palette, text: &str) {
+    let h = ui.spacing().interact_size.y.max(ui.text_style_height(&egui::TextStyle::Button) + 14.0);
+    ui.add_sized([56.0, h], egui::Label::new(RichText::new(text).color(pal.text_muted)));
+}
+
+/// Encabezado de página: título y una línea que explica para qué sirve.
+fn page_header(ui: &mut egui::Ui, pal: &Palette, title: &str, subtitle: &str) {
+    ui.label(RichText::new(title).strong().size(20.0).color(pal.text_strong));
+    ui.label(RichText::new(subtitle).color(pal.text_muted));
+    ui.add_space(16.0);
+}
+
+/// Tarjeta de ajustes: título, explicación opcional y sus controles.
+fn card(ui: &mut egui::Ui, pal: &Palette, title: &str, desc: Option<&str>, add: impl FnOnce(&mut egui::Ui)) {
+    Frame::new()
+        .fill(pal.card_bg)
+        .stroke(Stroke::new(1.0, pal.card_border))
+        .corner_radius(10)
+        .inner_margin(16)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(title).strong().size(15.0).color(pal.text_strong));
+            if let Some(d) = desc {
+                ui.label(RichText::new(d).small().color(pal.text_muted));
+            }
+            ui.add_space(6.0);
+            add(ui);
+        });
+    ui.add_space(12.0);
+}
+
+/// Entrada de la barra de navegación (36 px). La seleccionada lleva fondo y una barra de acento a la
+/// izquierda, así que no depende solo del color. `badge`: punto de aviso a la derecha.
+fn nav_item(ui: &mut egui::Ui, icon: &str, label: &str, selected: bool, badge: Option<Color32>, pal: &Palette) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, selected, label));
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let fill = if selected {
+            pal.nav_selected_bg
+        } else if resp.hovered() {
+            pal.nav_hover_bg
+        } else {
+            Color32::TRANSPARENT
+        };
+        painter.rect_filled(rect, CornerRadius::same(7), fill);
+        if selected {
+            let bar = Rect::from_min_size(rect.min + egui::vec2(0.0, 8.0), egui::vec2(3.0, rect.height() - 16.0));
+            painter.rect_filled(bar, CornerRadius::same(2), pal.accent);
+        }
+        if resp.has_focus() {
+            painter.rect_stroke(rect, CornerRadius::same(7), Stroke::new(2.0, pal.accent), egui::StrokeKind::Inside);
+        }
+        let color = if selected { pal.nav_selected_text } else { pal.text_strong };
+        let mid = rect.left_center();
+        painter.text(mid + egui::vec2(14.0, 0.0), egui::Align2::LEFT_CENTER, icon, egui::FontId::proportional(16.0), color);
+        painter.text(mid + egui::vec2(42.0, 0.0), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(14.0), color);
+        if let Some(c) = badge {
+            painter.circle_filled(rect.right_center() - egui::vec2(14.0, 0.0), 4.0, c);
+        }
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 #[derive(Default)]
@@ -1176,27 +1331,30 @@ struct CardActions {
 
 /// Dibuja una tarjeta de equipo y devuelve qué botones se pulsaron.
 /// `favorite` es `None` para equipos de la red (sin estrella/quitar) o `Some(fav)` para recientes.
-fn device_card(ui: &mut egui::Ui, name: &str, addr: &str, online: bool, busy: bool, favorite: Option<bool>) -> CardActions {
+fn device_card(ui: &mut egui::Ui, pal: &Palette, name: &str, addr: &str, online: bool, busy: bool, favorite: Option<bool>) -> CardActions {
     let mut act = CardActions::default();
-    Frame::group(ui.style()).corner_radius(10).inner_margin(12).show(ui, |ui| {
+    Frame::new().fill(pal.card_bg).stroke(Stroke::new(1.0, pal.card_border)).corner_radius(10).inner_margin(12).show(ui, |ui| {
         ui.set_width(168.0);
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("🖥").size(22.0));
                 ui.add_space(2.0);
-                ui.colored_label(if online { GREEN } else { Color32::from_gray(110) }, "●");
+                ui.colored_label(if online { pal.success_text } else { Color32::from_gray(110) }, "●");
                 if busy {
-                    ui.label(RichText::new("ocupado").small().color(ORANGE));
+                    ui.label(RichText::new("ocupado").small().color(pal.warning_text));
                 }
             });
             ui.add_space(4.0);
-            ui.label(RichText::new(truncate(name, 22)).strong().size(15.0));
-            ui.label(RichText::new(addr).small().color(Color32::GRAY));
+            ui.label(RichText::new(truncate(name, 22)).strong().size(15.0).color(pal.text_strong));
+            ui.label(RichText::new(addr).small().color(pal.text_muted));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 act.connect = ui.button(RichText::new("Conectar").strong()).clicked();
                 if let Some(fav) = favorite {
-                    if ui.button(if fav { "★" } else { "☆" }).on_hover_text("Favorito").clicked() {
+                    // «★/☆» no están en la fuente de egui (salía un rectángulo vacío).
+                    let star = RichText::new("⭐").color(if fav { pal.warning_text } else { pal.text_muted });
+                    let tip = if fav { "Quitar de favoritos" } else { "Marcar como favorito" };
+                    if ui.button(star).on_hover_text(tip).clicked() {
                         act.favorite = true;
                     }
                     if ui.button("✕").on_hover_text("Quitar de recientes").clicked() {
@@ -1209,8 +1367,8 @@ fn device_card(ui: &mut egui::Ui, name: &str, addr: &str, online: bool, busy: bo
     act
 }
 
-/// Colores del selector de monitores, de los tokens validados en replica/design/tokens*.json
-/// (0 fallos de contraste AA en claro y oscuro).
+/// Colores de la interfaz, de los tokens validados en replica/design/tokens*.json (0 fallos de
+/// contraste AA en claro y oscuro): selector de monitores, navegación y tarjetas de ajustes.
 struct Palette {
     surface: Color32,
     border_control: Color32,
@@ -1220,6 +1378,15 @@ struct Palette {
     hover_text: Color32,
     text_strong: Color32,
     text_muted: Color32,
+    nav_bg: Color32,
+    nav_hover_bg: Color32,
+    nav_selected_bg: Color32,
+    nav_selected_text: Color32,
+    card_bg: Color32,
+    card_border: Color32,
+    success_text: Color32,
+    warning_text: Color32,
+    danger_text: Color32,
 }
 
 impl Palette {
@@ -1236,6 +1403,15 @@ impl Palette {
                 hover_text: g(0xf5),
                 text_strong: g(0xd7),
                 text_muted: g(0xa0),
+                nav_bg: g(0x14),
+                nav_hover_bg: g(0x26),
+                nav_selected_bg: Color32::from_rgb(0x29, 0x3e, 0x5d),
+                nav_selected_text: Color32::from_rgb(0xd6, 0xe6, 0xff),
+                card_bg: g(0x23),
+                card_border: g(0x36),
+                success_text: Color32::from_rgb(0x5c, 0xc7, 0x7f),
+                warning_text: Color32::from_rgb(0xe3, 0xb2, 0x5a),
+                danger_text: Color32::from_rgb(0xf0, 0x85, 0x7d),
             }
         } else {
             Self {
@@ -1247,6 +1423,15 @@ impl Palette {
                 hover_text: Color32::BLACK,
                 text_strong: g(0x3c),
                 text_muted: g(0x6e),
+                nav_bg: g(0xf2),
+                nav_hover_bg: g(0xe1),
+                nav_selected_bg: Color32::from_rgb(0xd0, 0xdf, 0xf4),
+                nav_selected_text: Color32::from_rgb(0x0f, 0x47, 0x96),
+                card_bg: Color32::WHITE,
+                card_border: g(0xd4),
+                success_text: Color32::from_rgb(0x1e, 0x7a, 0x3e),
+                warning_text: Color32::from_rgb(0x87, 0x54, 0x00),
+                danger_text: Color32::from_rgb(0xb3, 0x26, 0x1e),
             }
         }
     }
