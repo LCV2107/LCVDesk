@@ -12,13 +12,17 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::time::Duration;
 use tracing::{info, warn};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetCursorPos,
+    AppendMenuW, BringWindowToTop, CreatePopupMenu, FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx,
+    GetForegroundWindow, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, MB_ICONQUESTION, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetCursorPos,
     GetMessageW, GetSystemMetrics, HICON, IMAGE_ICON, IsIconic, KillTimer, LR_SHARED, LoadImageW, MF_GRAYED,
     MF_SEPARATOR, MF_STRING, MSG, PostMessageW, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON,
     SW_HIDE, SW_RESTORE, SW_SHOW, SendMessageW, SetForegroundWindow, SetMenuDefaultItem, SetTimer, ShowWindow,
@@ -110,6 +114,58 @@ pub fn show_main() {
             let _ = ShowWindow(main, SW_RESTORE);
         }
         let _ = SetForegroundWindow(main);
+    }
+    if let Some(s) = STATE.get() {
+        s.ctx.request_repaint();
+    }
+}
+
+/// Llega una solicitud de conexión: la ventana sale de la bandeja, se pone al frente y por encima de
+/// todo hasta que se responda (`alert_done`), con el sonido de aviso de Windows.
+pub fn alert() {
+    let main = HWND(MAIN.load(Ordering::SeqCst) as _);
+    if main.0.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = ShowWindow(main, SW_SHOW);
+        if IsIconic(main).as_bool() {
+            let _ = ShowWindow(main, SW_RESTORE);
+        }
+        let _ = SetWindowPos(main, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        // Windows no deja que un programa en segundo plano se ponga delante sin más: se une un
+        // momento la entrada del hilo de la ventana con la del que está en primer plano.
+        let fg = GetForegroundWindow();
+        let (ours, theirs) = (GetWindowThreadProcessId(main, None), GetWindowThreadProcessId(fg, None));
+        let attached = theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, true).as_bool();
+        let _ = BringWindowToTop(main);
+        let focused = SetForegroundWindow(main).as_bool();
+        if attached {
+            let _ = AttachThreadInput(ours, theirs, false);
+        }
+        if !focused {
+            // Si aun así Windows no lo permite, al menos parpadea en la barra de tareas.
+            let fw = FLASHWINFO {
+                cbSize: size_of::<FLASHWINFO>() as u32,
+                hwnd: main,
+                dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+                uCount: 0,
+                dwTimeout: 0,
+            };
+            let _ = FlashWindowEx(&fw);
+        }
+        let _ = MessageBeep(MB_ICONQUESTION);
+    }
+    if let Some(s) = STATE.get() {
+        s.ctx.request_repaint();
+    }
+}
+
+/// Ya se respondió a la solicitud: la ventana deja de estar por encima de todo.
+pub fn alert_done() {
+    let main = HWND(MAIN.load(Ordering::SeqCst) as _);
+    if !main.0.is_null() {
+        let _ = unsafe { SetWindowPos(main, Some(HWND_NOTOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE) };
     }
     if let Some(s) = STATE.get() {
         s.ctx.request_repaint();

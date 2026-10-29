@@ -681,27 +681,24 @@ mod tests {
     }
 
     /// Lo mismo, pero por una sesión real de LCVDesk: host y visor de este equipo conectados por TCP
-    /// (127.0.0.1), con el botón «Abrir IGP_Soft» del visor. Acepta solo el diálogo de conexión.
+    /// (127.0.0.1), con el botón «Abrir IGP_Soft» del visor. Acepta sola la solicitud de conexión.
     /// `cargo test -p lcvdesk igp_soft_through_session -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn igp_soft_through_session() {
         use crate::viewer::{PluginState, Status, Viewer};
-        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, IDYES, PostMessageW, WM_COMMAND};
-        use windows::core::w;
 
         let _ = tracing_subscriber::fmt().with_test_writer().with_thread_names(true).try_init();
         let port = 47_170;
-        let _host = crate::host::Host::start(port);
+        let host = crate::host::Host::start(port);
         thread::sleep(Duration::from_millis(500));
 
-        // Pulsa «Sí» en el diálogo de aceptación del host en cuanto aparezca.
-        thread::spawn(|| {
+        // Acepta la solicitud de conexión en cuanto llegue (como el botón «Aceptar» de la interfaz).
+        let h = host.clone();
+        thread::spawn(move || {
             for _ in 0..100 {
-                if let Ok(hwnd) = unsafe { FindWindowW(None, w!("LCVDesk — Solicitud de conexión")) } {
-                    let _ = unsafe {
-                        PostMessageW(Some(hwnd), WM_COMMAND, windows::Win32::Foundation::WPARAM(IDYES.0 as usize), Default::default())
-                    };
+                if h.state().pending.is_some() {
+                    h.answer(true);
                     return;
                 }
                 thread::sleep(Duration::from_millis(100));

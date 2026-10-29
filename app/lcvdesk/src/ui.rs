@@ -8,10 +8,10 @@ use crate::plugins::{self, IGP_SOFT};
 use crate::recents::{self, SavedDevice};
 use crate::uac;
 use crate::updater::{self, Updater};
-use crate::viewer::{PluginState, Status, Viewer};
+use crate::viewer::{PluginState, RemoteCursor, Status, Viewer};
 use eframe::egui::{
     self, Color32, ColorImage, CornerRadius, Event, Frame, Key, Modifiers, PointerButton, Rect,
-    RichText, Sense, Stroke, TextureHandle, TextureOptions, ThemePreference, pos2,
+    Pos2, RichText, Sense, Stroke, TextureHandle, TextureOptions, ThemePreference, Vec2, pos2, vec2,
 };
 use eframe::egui_wgpu::SurfaceConfig;
 use lcv_proto::{Message, MouseButton};
@@ -183,6 +183,64 @@ struct App {
     /// IGP_Soft en este equipo, releído del registro cada pocos segundos.
     igp_local: Option<plugins::Installed>,
     igp_checked: Option<std::time::Instant>,
+    /// Cómo se ajusta la pantalla remota a la ventana (se recuerda por equipo).
+    view: ViewMode,
+    /// Equipo para el que se cargó `view`.
+    view_host: String,
+    /// Punto de la imagen remota (en sus píxeles) que queda en el centro de la vista.
+    view_center: Option<Pos2>,
+    /// Zoom efectivo del último fotograma dibujado, en % (100 = un píxel remoto por píxel tuyo).
+    view_pct: f32,
+    /// Formas del puntero remoto ya convertidas en texturas, por id.
+    cursor_textures: std::collections::HashMap<u64, CursorTexture>,
+    /// Tamaño del puntero remoto respecto al real (persistido).
+    cursor_scale: f32,
+}
+
+/// Cómo se ajusta la pantalla remota a la ventana. La resolución del equipo remoto no cambia nunca.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ViewMode {
+    /// Entera dentro de la ventana.
+    Fit,
+    /// Llena el ancho (monitores panorámicos y curvos) y se desplaza en vertical.
+    FitWidth,
+    /// Porcentaje fijo; 100 = tamaño real.
+    Zoom(u16),
+}
+
+const ZOOM_STEPS: [u16; 13] = [25, 33, 50, 67, 75, 90, 100, 110, 125, 150, 200, 300, 400];
+
+impl ViewMode {
+    fn parse(s: &str) -> Self {
+        match s {
+            "width" => Self::FitWidth,
+            _ => s.parse::<u16>().ok().filter(|p| ZOOM_STEPS.contains(p)).map_or(Self::Fit, Self::Zoom),
+        }
+    }
+
+    fn as_str(self) -> String {
+        match self {
+            Self::Fit => "fit".into(),
+            Self::FitWidth => "width".into(),
+            Self::Zoom(p) => p.to_string(),
+        }
+    }
+
+    /// Puntos de egui por píxel remoto.
+    fn scale(self, area: Rect, size: Vec2, pixels_per_point: f32) -> f32 {
+        match self {
+            Self::Fit => (area.width() / size.x).min(area.height() / size.y),
+            Self::FitWidth => area.width() / size.x,
+            Self::Zoom(p) => p as f32 / 100.0 / pixels_per_point,
+        }
+    }
+}
+
+/// Forma del puntero remoto lista para dibujar (tamaño y punto activo en sus píxeles).
+struct CursorTexture {
+    tex: TextureHandle,
+    size: Vec2,
+    hot: Vec2,
 }
 
 impl App {
@@ -219,6 +277,12 @@ impl App {
             plugins_allowed: crate::settings::load_plugins_allowed(),
             igp_local: None,
             igp_checked: None,
+            view: ViewMode::Fit,
+            view_host: String::new(),
+            view_center: None,
+            view_pct: 100.0,
+            cursor_textures: Default::default(),
+            cursor_scale: crate::settings::load_cursor_scale(),
         }
     }
 
@@ -473,6 +537,39 @@ impl App {
         });
     }
 
+    /// Solicitud de conexión entrante: aviso modal encima de todo (la ventana ya salió al frente).
+    fn consent_dialog(&mut self, ctx: &egui::Context) {
+        let Some((name, ip, since)) = self.host.state().pending.as_ref().map(|r| (r.name.clone(), r.ip, r.since)) else {
+            return;
+        };
+        let pal = Palette::of(ctx.global_style().visuals.dark_mode);
+        let left = crate::host::CONSENT_TIMEOUT.saturating_sub(since.elapsed()).as_secs();
+        let mut answer = None;
+        egui::Modal::new(egui::Id::unique("consent")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.label(RichText::new("Solicitud de conexión").strong().size(15.0).color(pal.text_strong));
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("«{name}» ({ip}) quiere ver y controlar este equipo.")).color(pal.text_strong));
+            ui.add_space(4.0);
+            ui.label(RichText::new(format!("Si no respondes, se rechazará en {left} s.")).small().color(pal.text_muted));
+            ui.label(RichText::new("La conexión todavía no está cifrada.").small().color(pal.warning_text));
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let accept = egui::Button::new(RichText::new("Aceptar").strong().color(pal.on_accent)).fill(pal.accent);
+                if ui.add(accept).clicked() {
+                    answer = Some(true);
+                }
+                if ui.button("Rechazar").clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+        if let Some(a) = answer {
+            self.host.answer(a);
+        }
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
+
     /// Aviso discreto (no crítico) de actualización disponible, en la parte superior.
     fn update_banner(&mut self, ui: &mut egui::Ui) {
         if self.update_dismissed {
@@ -563,6 +660,9 @@ impl App {
         }
         self.texture = None;
         self.previews.clear();
+        self.cursor_textures.clear();
+        self.view_host.clear();
+        self.view_center = None;
         self.last_close_reason = None;
         self.controlling = false;
         self.recorded_recent = false;
@@ -807,6 +907,10 @@ impl App {
             let need_password = matches!(sh.status, Status::NeedPassword);
             (text, sh.stats, sh.frame.take(), closed, need_password, sh.displays.clone(), sh.current_display, sh.host_id.clone(), sh.host_name.clone())
         };
+        let (cursor_supported, cursor, shapes) = {
+            let mut sh = viewer.shared();
+            (sh.cursor_supported, sh.cursor, std::mem::take(&mut sh.cursor_shapes))
+        };
 
         if closed {
             self.last_close_reason = status_text;
@@ -827,6 +931,19 @@ impl App {
             recents::record(&host_id, &host_name, &target);
             self.recents = recents::load();
             self.recorded_recent = true;
+        }
+        // Vista recordada para este equipo (p. ej. un 4K siempre a tamaño real).
+        if !host_id.is_empty() && self.view_host != host_id {
+            self.view = ViewMode::parse(&crate::settings::load_view(&host_id));
+            self.view_host = host_id.clone();
+            self.view_center = None;
+        }
+        // Formas de puntero recién llegadas → texturas.
+        for c in shapes {
+            let image = ColorImage::from_rgba_unmultiplied([c.width as usize, c.height as usize], &c.rgba);
+            let tex = ui.ctx().load_texture(format!("cursor-{}", c.id), image, TextureOptions::LINEAR);
+            let size = vec2(c.width as f32, c.height as f32);
+            self.cursor_textures.insert(c.id, CursorTexture { tex, size, hot: vec2(c.hot_x as f32, c.hot_y as f32) });
         }
 
         if let Some(f) = frame {
@@ -852,6 +969,7 @@ impl App {
 
         let igp_local = self.igp_local();
         let mut toggle_capture = false;
+        let (mut new_view, mut new_cursor_scale) = (None, None);
         ui.horizontal(|ui| {
             let viewer = self.viewer.as_ref().unwrap();
             // Antes de que acepten (conectando / esperando) sirve para cancelar el intento.
@@ -890,6 +1008,7 @@ impl App {
                     }
                 }
                 plugins_button(ui, viewer, igp_local.as_ref());
+                view_menu(ui, self.view, self.view_pct, self.cursor_scale, cursor_supported, &mut new_view, &mut new_cursor_scale);
             }
             // Monitores del equipo remoto como botones 1 2 3… con vista previa al pasar el cursor
             // (solo si tiene más de uno). Especificación: replica/design/components.md.
@@ -928,6 +1047,16 @@ impl App {
                 }
             };
         });
+        if let Some(v) = new_view {
+            self.view = v;
+            if !self.view_host.is_empty() {
+                crate::settings::save_view(&self.view_host, &v.as_str());
+            }
+        }
+        if let Some(k) = new_cursor_scale {
+            self.cursor_scale = k;
+            crate::settings::save_cursor_scale(k);
+        }
         if toggle_capture {
             self.capture = !self.capture;
             if !self.capture {
@@ -949,21 +1078,116 @@ impl App {
         }
 
         let area = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(area, 0.0, Color32::BLACK);
-        let image_rect = self.texture.as_ref().map(|tex| {
-            let size = tex.size_vec2();
-            let scale = (area.width() / size.x).min(area.height() / size.y);
-            let rect = Rect::from_center_size(area.center(), size * scale);
-            ui.painter().image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-            rect
-        });
-
         let response = ui.allocate_rect(area, Sense::click_and_drag());
+        let painter = ui.painter_at(area);
+        painter.rect_filled(area, 0.0, Color32::BLACK);
+        let ppp = ui.ctx().pixels_per_point();
+        let hover = ui.input(|i| i.pointer.hover_pos()).filter(|_| response.contains_pointer());
+        let dt = ui.input(|i| i.stable_dt).min(0.05);
+        let mut image = None;
+        if let Some((tex_id, size)) = self.texture.as_ref().map(|t| (t.id(), t.size_vec2())) {
+            let scale = self.view.scale(area, size, ppp);
+            self.view_pct = scale * ppp * 100.0;
+            let (rect, panning) = self.place_image(area, size, scale, ppp, hover, cursor, dt);
+            painter.image(tex_id, rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            scroll_indicators(&painter, area, rect);
+            if panning {
+                ui.ctx().request_repaint();
+            }
+            image = Some((rect, scale));
+        }
+        let image_rect = image.map(|(rect, _)| rect);
+
+        // Puntero remoto encima de la imagen, siempre a su tamaño real (por reducida que se vea la
+        // pantalla). Sobre la imagen sigue a tu ratón sin retraso y oculta el de Windows; fuera de
+        // ella se dibuja donde está en el equipo remoto.
+        if let (Some((rect, scale)), Some(rc)) = (image, cursor.filter(|_| cursor_supported && status_text.is_none()))
+            && let Some(ct) = self.cursor_textures.get(&rc.id)
+        {
+            let over = hover.filter(|p| rect.contains(*p));
+            if over.is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+            }
+            let at = match over {
+                Some(p) => rc.visible.then_some(p),
+                None => rc.visible.then(|| rect.min + vec2(rc.x as f32, rc.y as f32) * scale),
+            };
+            if let Some(at) = at {
+                let k = self.cursor_scale / ppp;
+                let min = at - ct.hot * k;
+                let min = pos2((min.x * ppp).round() / ppp, (min.y * ppp).round() / ppp);
+                let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                painter.image(ct.tex.id(), Rect::from_min_size(min, ct.size * k), uv, Color32::WHITE);
+            }
+        }
         if status_text.is_none() {
             self.handle_control(ui, &response, image_rect);
         } else {
             keyhook::set_grab(false);
         }
+    }
+
+    /// Coloca la imagen remota (de `size` píxeles a `scale` puntos por píxel) en `area`. Si no cabe,
+    /// acercar el ratón a un borde desplaza la vista; sin el ratón encima, la vista sigue al puntero
+    /// remoto cuando sale de ella. Devuelve el rectángulo de la imagen y si se está desplazando.
+    #[allow(clippy::too_many_arguments)]
+    fn place_image(
+        &mut self,
+        area: Rect,
+        size: Vec2,
+        scale: f32,
+        ppp: f32,
+        hover: Option<Pos2>,
+        cursor: Option<RemoteCursor>,
+        dt: f32,
+    ) -> (Rect, bool) {
+        /// Franja junto a cada borde que desplaza la vista, y velocidad máxima (puntos por segundo).
+        const EDGE: f32 = 56.0;
+        const SPEED: f32 = 1800.0;
+        let shown = size * scale;
+        let overflow = vec2(
+            if shown.x > area.width() + 0.5 { 1.0 } else { 0.0 },
+            if shown.y > area.height() + 0.5 { 1.0 } else { 0.0 },
+        );
+        let mut c = self.view_center.unwrap_or(pos2(size.x / 2.0, size.y / 2.0));
+        let half = area.size() / scale / 2.0;
+        let mut panning = false;
+        match hover {
+            Some(p) => {
+                let push = |pos: f32, min: f32, max: f32| {
+                    if pos < min + EDGE {
+                        -(1.0 - (pos - min) / EDGE)
+                    } else if pos > max - EDGE {
+                        1.0 - (max - pos) / EDGE
+                    } else {
+                        0.0
+                    }
+                };
+                let d = vec2(push(p.x, area.min.x, area.max.x), push(p.y, area.min.y, area.max.y)) * overflow;
+                if d != Vec2::ZERO {
+                    let before = clamp_center(c, half, size);
+                    c = clamp_center(before + d * SPEED * dt / scale, half, size);
+                    panning = c != before;
+                }
+            }
+            None => {
+                if let Some(rc) = cursor.filter(|r| r.visible) {
+                    let p = pos2(rc.x as f32, rc.y as f32);
+                    if overflow.x > 0.0 && (p.x < c.x - half.x || p.x > c.x + half.x) {
+                        c.x = p.x;
+                    }
+                    if overflow.y > 0.0 && (p.y < c.y - half.y || p.y > c.y + half.y) {
+                        c.y = p.y;
+                    }
+                }
+            }
+        }
+        let c = clamp_center(c, half, size);
+        self.view_center = Some(c);
+        let min = area.center() - c.to_vec2() * scale;
+        // Alineada a píxeles físicos: a tamaño real se ve nítida, sin medio píxel de desenfoque.
+        let min = pos2((min.x * ppp).round() / ppp, (min.y * ppp).round() / ppp);
+        (Rect::from_min_size(min, shown), panning)
     }
 
     /// Cuadro para introducir la contraseña del equipo al que te conectas (aparece cada vez, salvo
@@ -1141,6 +1365,7 @@ impl eframe::App for App {
                 return;
             }
         }
+        self.consent_dialog(ui.ctx());
         if self.viewer.is_some() {
             egui::CentralPanel::default().show(ui, |ui| self.remote(ui));
         } else {
@@ -1205,6 +1430,101 @@ fn plugins_button(ui: &mut egui::Ui, viewer: &Viewer, local: Option<&plugins::In
         None => RichText::new("🔌 Complementos"),
     };
     ui.menu_button(title, |ui| plugins_menu(ui, viewer, local, state));
+}
+
+/// Centro de la vista dentro de la imagen: sin enseñar nada fuera de ella; centrada si cabe entera.
+fn clamp_center(c: Pos2, half: Vec2, size: Vec2) -> Pos2 {
+    let axis = |c: f32, half: f32, len: f32| if half * 2.0 >= len { len / 2.0 } else { c.clamp(half, len - half) };
+    pos2(axis(c.x, half.x, size.x), axis(c.y, half.y, size.y))
+}
+
+/// Barras finas que indican qué parte de la pantalla remota se ve cuando no cabe entera.
+fn scroll_indicators(painter: &egui::Painter, area: Rect, image: Rect) {
+    let color = Color32::from_white_alpha(110);
+    if image.width() > area.width() + 0.5 {
+        let from = (area.min.x - image.min.x) / image.width();
+        let to = (area.max.x - image.min.x) / image.width();
+        let x0 = area.min.x + from * area.width();
+        let x1 = area.min.x + to * area.width();
+        painter.rect_filled(Rect::from_x_y_ranges(x0..=x1, area.max.y - 5.0..=area.max.y - 2.0), 2.0, color);
+    }
+    if image.height() > area.height() + 0.5 {
+        let from = (area.min.y - image.min.y) / image.height();
+        let to = (area.max.y - image.min.y) / image.height();
+        let y0 = area.min.y + from * area.height();
+        let y1 = area.min.y + to * area.height();
+        painter.rect_filled(Rect::from_x_y_ranges(area.max.x - 5.0..=area.max.x - 2.0, y0..=y1), 2.0, color);
+    }
+}
+
+/// Menú «🔍» de la sesión: ajuste de la pantalla remota y tamaño del puntero.
+fn view_menu(
+    ui: &mut egui::Ui,
+    view: ViewMode,
+    pct: f32,
+    cursor_scale: f32,
+    cursor_supported: bool,
+    new_view: &mut Option<ViewMode>,
+    new_cursor_scale: &mut Option<f32>,
+) {
+    let title = match view {
+        ViewMode::Fit => format!("🔍 Ajustar ({pct:.0} %)"),
+        ViewMode::FitWidth => format!("🔍 Al ancho ({pct:.0} %)"),
+        ViewMode::Zoom(100) => "🔍 Tamaño real".to_string(),
+        ViewMode::Zoom(p) => format!("🔍 {p} %"),
+    };
+    ui.menu_button(title, |ui| {
+        ui.set_min_width(260.0);
+        ui.label(RichText::new("Pantalla remota").strong());
+        if ui.radio(view == ViewMode::Fit, "Ajustar a la ventana").clicked() {
+            *new_view = Some(ViewMode::Fit);
+        }
+        if ui
+            .radio(view == ViewMode::FitWidth, "Ajustar al ancho")
+            .on_hover_text("Para monitores panorámicos y curvos: llena el ancho. Lleva el ratón al borde de arriba o de abajo para moverte.")
+            .clicked()
+        {
+            *new_view = Some(ViewMode::FitWidth);
+        }
+        if ui
+            .radio(view == ViewMode::Zoom(100), "Tamaño real (1:1)")
+            .on_hover_text("Un píxel del equipo remoto por cada píxel de tu pantalla. Lleva el ratón a un borde para moverte.")
+            .clicked()
+        {
+            *new_view = Some(ViewMode::Zoom(100));
+        }
+        ui.horizontal(|ui| {
+            ui.label("Zoom");
+            let down = ZOOM_STEPS.iter().rev().copied().find(|&s| (s as f32) < pct - 0.5);
+            let up = ZOOM_STEPS.iter().copied().find(|&s| s as f32 > pct + 0.5);
+            if ui.add_enabled(down.is_some(), egui::Button::new(" − ")).clicked() {
+                *new_view = down.map(ViewMode::Zoom);
+            }
+            ui.label(RichText::new(format!("{pct:.0} %")).monospace());
+            if ui.add_enabled(up.is_some(), egui::Button::new(" + ")).clicked() {
+                *new_view = up.map(ViewMode::Zoom);
+            }
+        });
+        ui.label(RichText::new("La resolución del equipo remoto no cambia.").small().color(Color32::GRAY));
+        ui.separator();
+        ui.label(RichText::new("Puntero").strong());
+        if cursor_supported {
+            for (k, name) in [(1.0, "Normal"), (1.5, "Grande"), (2.0, "Muy grande")] {
+                if ui.radio(cursor_scale == k, name).clicked() {
+                    *new_cursor_scale = Some(k);
+                }
+            }
+        } else {
+            ui.label(
+                RichText::new(
+                    "El otro equipo tiene una versión anterior de LCVDesk: el puntero va dentro de la imagen \
+                     y se reduce con ella. Actualízalo para verlo siempre a tamaño real.",
+                )
+                .small()
+                .color(Color32::GRAY),
+            );
+        }
+    });
 }
 
 fn plugins_menu(ui: &mut egui::Ui, viewer: &Viewer, local: Option<&plugins::Installed>, state: Option<PluginState>) {

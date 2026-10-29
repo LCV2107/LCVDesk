@@ -4,7 +4,7 @@ use eframe::egui;
 use lcv_codec::H264Decoder;
 use crate::plugins::{self, Channel};
 use lcv_proto::{
-    AUDIO_PROTOCOL_VERSION, DEFAULT_PORT, DisplayInfo, MIN_PROTOCOL_VERSION, Message, PLUGIN_ACCESS_DENIED, PLUGIN_NOT_ALLOWED,
+    AUDIO_PROTOCOL_VERSION, CURSOR_PROTOCOL_VERSION, CursorShape, DEFAULT_PORT, DisplayInfo, MIN_PROTOCOL_VERSION, Message, PLUGIN_ACCESS_DENIED, PLUGIN_NOT_ALLOWED,
     PLUGIN_NOT_INSTALLED, PLUGIN_NOT_RESPONDING, PLUGIN_PROTOCOL_VERSION, PROTOCOL_VERSION, PluginInfo, REJECT_VERSION,
     read_message, write_message,
 };
@@ -73,6 +73,21 @@ pub struct Shared {
     pub remote_plugins: Option<Vec<PluginInfo>>,
     /// Estado de cada complemento por id.
     pub plugin_state: HashMap<String, PluginState>,
+    /// El host envía el puntero aparte de la imagen (v5): la interfaz lo dibuja encima.
+    pub cursor_supported: bool,
+    /// Último puntero del host.
+    pub cursor: Option<RemoteCursor>,
+    /// Formas de puntero recién llegadas; la interfaz las convierte en texturas.
+    pub cursor_shapes: Vec<CursorShape>,
+}
+
+/// Puntero del equipo remoto: su punto activo en píxeles del monitor que se ve y su forma (`id`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteCursor {
+    pub id: u64,
+    pub x: i32,
+    pub y: i32,
+    pub visible: bool,
 }
 
 type Channels = Arc<Mutex<HashMap<u32, Arc<Channel>>>>;
@@ -114,6 +129,9 @@ impl Viewer {
             plugin_supported: false,
             remote_plugins: None,
             plugin_state: HashMap::new(),
+            cursor_supported: false,
+            cursor: None,
+            cursor_shapes: Vec::new(),
         }));
         let channels: Channels = Default::default();
         let stop = Arc::new(AtomicBool::new(false));
@@ -396,6 +414,7 @@ fn run(
                 sh.host_name = host_name;
                 sh.audio_supported = version >= AUDIO_PROTOCOL_VERSION;
                 sh.plugin_supported = version >= PLUGIN_PROTOCOL_VERSION;
+                sh.cursor_supported = version >= CURSOR_PROTOCOL_VERSION;
                 drop(sh);
                 if version >= PLUGIN_PROTOCOL_VERSION
                     && let Some(s) = lock(writer).as_mut()
@@ -419,7 +438,7 @@ fn run(
                 sh.displays = displays;
                 sh.current_display = current;
             }
-            // Host antiguo que no conoce esta versión: se reintenta con la anterior (4 → 3 → 2). El
+            // Host antiguo que no conoce esta versión: se reintenta con la anterior (5 → 4 → 3 → 2). El
             // rechazo por versión llega antes de pedir contraseña o aceptación, así que no se repiten.
             Message::Rejected { reason } if reason == REJECT_VERSION && version > MIN_PROTOCOL_VERSION => {
                 info!("el host no admite la versión {version} del protocolo; reintentando con la {}", version - 1);
@@ -482,6 +501,14 @@ fn run(
                     lock(shared).plugin_state.remove(&ch.plugin);
                     ctx.request_repaint();
                 }
+            }
+            Message::CursorShape(shape) => {
+                lock(shared).cursor_shapes.push(shape);
+                ctx.request_repaint();
+            }
+            Message::CursorPos { id, x, y, visible } => {
+                lock(shared).cursor = Some(RemoteCursor { id, x, y, visible });
+                ctx.request_repaint();
             }
             Message::Pong { t_us } => {
                 let rtt = (clock.elapsed().as_micros() as u64).saturating_sub(t_us) as f32 / 1000.0;
@@ -674,5 +701,62 @@ impl Window {
         );
         *self = Self::new();
         Some(r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sesión real host ↔ visor en este equipo (127.0.0.1): con la versión 5, el puntero llega
+    /// aparte del vídeo (su forma y su posición). Mueve el ratón un instante y lo devuelve a su sitio.
+    /// `cargo test -p lcvdesk cursor_through_session -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn cursor_through_session() {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+
+        let _ = tracing_subscriber::fmt().with_test_writer().with_thread_names(true).try_init();
+        let port = 47_172;
+        let host = crate::host::Host::start(port);
+        thread::sleep(Duration::from_millis(500));
+        let h = host.clone();
+        thread::spawn(move || {
+            for _ in 0..100 {
+                if h.state().pending.is_some() {
+                    h.answer(true);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let viewer = Viewer::connect(format!("127.0.0.1:{port}"), "prueba".into(), None, egui::Context::default());
+        let wait = |what: &str, ok: &dyn Fn() -> bool| {
+            let t = Instant::now();
+            while !ok() {
+                assert!(t.elapsed() < Duration::from_secs(20), "tiempo agotado esperando: {what}");
+                thread::sleep(Duration::from_millis(50));
+            }
+            println!("ok: {what} ({:.2} s)", t.elapsed().as_secs_f32());
+        };
+        wait("sesión aceptada", &|| matches!(viewer.shared().status, Status::Streaming));
+        assert!(viewer.shared().cursor_supported, "la sesión debería hablar la versión 5");
+
+        let mut original = POINT::default();
+        unsafe { GetCursorPos(&mut original) }.unwrap();
+        let (x, y) = (200, 150);
+        unsafe { SetCursorPos(x, y) }.unwrap();
+        wait("posición del puntero", &|| viewer.shared().cursor.is_some_and(|c| c.visible && (c.x, c.y) == (x, y)));
+        unsafe { SetCursorPos(original.x, original.y) }.unwrap();
+
+        let sh = viewer.shared();
+        let id = sh.cursor.unwrap().id;
+        let shape = sh.cursor_shapes.iter().find(|s| s.id == id).expect("la forma del puntero actual");
+        println!("puntero {id:#x}: {}x{}, punto activo {},{}", shape.width, shape.height, shape.hot_x, shape.hot_y);
+        assert_eq!(shape.rgba.len(), (shape.width * shape.height * 4) as usize);
+        drop(sh);
+        viewer.disconnect();
+        thread::sleep(Duration::from_millis(500));
     }
 }

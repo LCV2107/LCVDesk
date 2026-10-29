@@ -32,6 +32,7 @@ Objetivo: latencia mínima (15–30 ms extremo a extremo en LAN gigabit).
 | 4.5 Portapapeles y archivos | Pendiente |
 | Actualización por GitHub (updater) | Implementada — requiere fijar el repositorio |
 | Complemento IGP_Soft (manejar las pantallas del remoto desde IGP_Soft) | Implementado (0.4.0-beta.1) — en pruebas ([docs/IGP_SOFT.md](docs/IGP_SOFT.md)) |
+| Pantallas grandes (2K, 4K, panorámicas): vista ajustada, al ancho o a tamaño real con zoom; puntero aparte del vídeo, siempre a tamaño real (protocolo v5) | Implementado — en pruebas, sin publicar |
 
 ## Requisitos de compilación
 

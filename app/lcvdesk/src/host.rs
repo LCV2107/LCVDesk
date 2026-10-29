@@ -6,7 +6,7 @@ use lcv_codec::H264Encoder;
 use lcv_input::{Injector, TargetRect};
 use crate::plugins;
 use lcv_proto::{
-    AUDIO_PROTOCOL_VERSION, AudioChunk, DisplayInfo, DisplayPreview, MIN_PROTOCOL_VERSION, Message, PLUGIN_ACCESS_DENIED,
+    AUDIO_PROTOCOL_VERSION, AudioChunk, CURSOR_PROTOCOL_VERSION, CursorShape, DisplayInfo, DisplayPreview, MIN_PROTOCOL_VERSION, Message, PLUGIN_ACCESS_DENIED,
     PLUGIN_NOT_ALLOWED, PLUGIN_NOT_INSTALLED, PLUGIN_NOT_RESPONDING, PLUGIN_UNKNOWN, PROTOCOL_VERSION, REJECT_VERSION, VideoFrame,
     read_message, write_message,
 };
@@ -18,10 +18,6 @@ use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
-use windows::Win32::UI::WindowsAndMessaging::{
-    IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MessageBoxW,
-};
-use windows::core::HSTRING;
 
 const NO_DISPLAY: u32 = u32::MAX;
 
@@ -37,6 +33,16 @@ pub struct HostState {
     pub port: u16,
     pub listen_error: Option<String>,
     pub session: Option<SessionInfo>,
+    /// Solicitud de conexión esperando que el usuario la acepte o rechace en la interfaz.
+    pub pending: Option<ConsentRequest>,
+}
+
+/// Una solicitud de conexión pendiente. La interfaz la muestra y responde con `Host::answer`.
+pub struct ConsentRequest {
+    pub name: String,
+    pub ip: std::net::IpAddr,
+    pub since: Instant,
+    answer: mpsc::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -62,6 +68,13 @@ impl Host {
     /// Indicador compartido de sesión activa, para el anuncio de descubrimiento.
     pub fn busy_flag(&self) -> Arc<AtomicBool> {
         self.busy.clone()
+    }
+
+    /// Respuesta del usuario a la solicitud de conexión pendiente.
+    pub fn answer(&self, accept: bool) {
+        if let Some(req) = self.state().pending.take() {
+            let _ = req.answer.send(accept);
+        }
     }
 
     /// Corta la sesión activa (botón "Desconectar" del equipo controlado).
@@ -155,9 +168,11 @@ fn handle(mut stream: TcpStream, state: &Arc<Mutex<HostState>>, busy: &Arc<Atomi
     if authed {
         info!("{name} ({peer}) autenticado por contraseña");
     }
-    if !authed && !ask_consent(&name, peer) {
-        reject(&mut stream, "El usuario rechazó la conexión");
-        bail!("rechazada por el usuario");
+    if !authed
+        && let Err(reason) = ask_consent(&name, peer, &stream, state)
+    {
+        reject(&mut stream, reason);
+        bail!("no aceptada: {reason}");
     }
     stream.set_read_timeout(None)?;
 
@@ -194,22 +209,53 @@ fn verify_password(stream: &mut TcpStream) -> anyhow::Result<bool> {
     Ok(crate::auth::constant_eq(&expected, &mac))
 }
 
-/// Aceptación explícita mínima. La ventana completa (permisos, código de verificación) llega en la Fase 4.4.
-fn ask_consent(name: &str, peer: SocketAddr) -> bool {
-    let text = format!(
-        "El equipo «{name}» ({}) quiere ver y controlar tu pantalla.\n\n¿Permitir la conexión?\n\n\
-         Versión de pruebas: la conexión todavía no está cifrada.",
-        peer.ip()
-    );
-    let answer = unsafe {
-        MessageBoxW(
-            None,
-            &HSTRING::from(text),
-            &HSTRING::from("LCVDesk — Solicitud de conexión"),
-            MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND,
-        )
+/// Plazo para responder a una solicitud de conexión antes de rechazarla sola.
+pub const CONSENT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Pide permiso al usuario dentro de LCVDesk: la ventana sale al frente (aunque esté en la bandeja)
+/// con el aviso «Aceptar / Rechazar». Se rechaza si no hay respuesta en `CONSENT_TIMEOUT` o si el
+/// visor cancela (cierra la conexión) mientras tanto. `Err` lleva el motivo que se le envía al visor.
+fn ask_consent(name: &str, peer: SocketAddr, stream: &TcpStream, state: &Arc<Mutex<HostState>>) -> Result<(), &'static str> {
+    let (tx, rx) = mpsc::channel();
+    {
+        let mut st = lock(state);
+        if st.pending.is_some() {
+            info!("solicitud de {name} ({}) rechazada: ya hay otra esperando respuesta", peer.ip());
+            return Err("El equipo está atendiendo otra solicitud de conexión");
+        }
+        st.pending = Some(ConsentRequest { name: name.into(), ip: peer.ip(), since: Instant::now(), answer: tx });
+    }
+    info!("solicitud de conexión de {name} ({}): esperando respuesta", peer.ip());
+    crate::tray::alert();
+
+    // Lecturas cortas solo para notar si el visor cancela; no se consume nada del flujo.
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
+    let deadline = Instant::now() + CONSENT_TIMEOUT;
+    let answer = loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(true) => break Ok(()),
+            Ok(false) => break Err("El usuario rechazó la conexión"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break Err("El usuario rechazó la conexión"),
+        }
+        let mut probe = [0u8; 1];
+        match stream.peek(&mut probe) {
+            Ok(0) => break Err("El otro equipo canceló la solicitud"),
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(_) => break Err("El otro equipo canceló la solicitud"),
+        }
+        if Instant::now() >= deadline {
+            break Err("No se respondió a la solicitud a tiempo");
+        }
     };
-    answer == IDYES
+    lock(state).pending = None;
+    crate::tray::alert_done();
+    match answer {
+        Ok(()) => info!("solicitud de {name}: aceptada"),
+        Err(reason) => info!("solicitud de {name}: {reason}"),
+    }
+    answer
 }
 
 fn to_proto(d: &lcv_capture::DisplayInfo) -> DisplayInfo {
@@ -237,6 +283,9 @@ fn run_session(stream: TcpStream, stop: Arc<AtomicBool>, peer_version: u32) -> a
     let displays = lcv_capture::enumerate().context("no se pudieron enumerar los monitores")?;
     let start_index = displays.iter().find(|d| d.primary).map_or(0, |d| d.index);
     let mut capturer = Capturer::new(start_index).context("no se pudo iniciar la captura")?;
+    // Visor con puntero aparte (v5): no se pinta en la imagen; lo envía su propio hilo.
+    let cursor_apart = peer_version >= CURSOR_PROTOCOL_VERSION;
+    capturer.set_with_cursor(!cursor_apart);
     let cur = capturer.display().clone();
     info!("transmitiendo monitor {} {}x{} a {fps} fps, captura {:?}", cur.index, cur.width, cur.height, capturer.backend());
 
@@ -278,6 +327,11 @@ fn run_session(stream: TcpStream, stop: Arc<AtomicBool>, peer_version: u32) -> a
     } else {
         info!("el visor usa la versión {peer_version} del protocolo: sesión sin audio");
     }
+    // Monitor que se transmite, para dar la posición del puntero relativa a él.
+    let cursor_area = Arc::new(Mutex::new(target_rect(&cur)));
+    if cursor_apart {
+        spawn_cursor(tx.clone(), cursor_area.clone(), stop.clone());
+    }
 
     let interval = Duration::from_secs_f32(1.0 / fps);
     let mut encoder: Option<H264Encoder> = None;
@@ -294,8 +348,10 @@ fn run_session(stream: TcpStream, stop: Arc<AtomicBool>, peer_version: u32) -> a
         let req = requested_display.swap(NO_DISPLAY, Ordering::Relaxed);
         if req != NO_DISPLAY && req != capturer.display().index {
             match Capturer::new(req) {
-                Ok(c) => {
+                Ok(mut c) => {
+                    c.set_with_cursor(!cursor_apart);
                     let d = c.display().clone();
+                    *lock(&cursor_area) = target_rect(&d);
                     info!("cambiando al monitor {} {}x{}", d.index, d.width, d.height);
                     capturer = c;
                     encoder = None;
@@ -456,6 +512,54 @@ fn spawn_previews(
                 if tx.try_send(msg).is_ok() {
                     last_sent.insert(index, Instant::now());
                 }
+            }
+        })
+        .ok();
+}
+
+/// Envía el puntero aparte del vídeo (visores v5): su forma una vez por cursor distinto y su
+/// posición cada vez que cambia, unas 120 veces por segundo como mucho.
+fn spawn_cursor(tx: SyncSender<Message>, area: Arc<Mutex<TargetRect>>, stop: Arc<AtomicBool>) {
+    thread::Builder::new()
+        .name("host-cursor".into())
+        .spawn(move || {
+            let mut shapes_sent = std::collections::HashSet::new();
+            let mut last = None;
+            while !stop.load(Ordering::Relaxed) {
+                let r = *lock(&area);
+                let msg = match lcv_capture::cursor_state() {
+                    Some(c) => {
+                        let (x, y) = (c.x - r.x, c.y - r.y);
+                        let inside = x >= 0 && y >= 0 && (x as u32) < r.width && (y as u32) < r.height;
+                        if c.visible && shapes_sent.insert(c.id) {
+                            match lcv_capture::cursor_image(c.id) {
+                                Some(img) => {
+                                    let shape = CursorShape {
+                                        id: c.id,
+                                        width: img.width,
+                                        height: img.height,
+                                        hot_x: img.hot_x,
+                                        hot_y: img.hot_y,
+                                        rgba: img.rgba,
+                                    };
+                                    if tx.send(Message::CursorShape(shape)).is_err() {
+                                        break;
+                                    }
+                                }
+                                None => warn!("puntero {:#x}: no se pudo leer su forma", c.id),
+                            }
+                        }
+                        Message::CursorPos { id: c.id, x, y, visible: c.visible && inside }
+                    }
+                    None => Message::CursorPos { id: 0, x: 0, y: 0, visible: false },
+                };
+                if last.as_ref() != Some(&msg) {
+                    if tx.send(msg.clone()).is_err() {
+                        break;
+                    }
+                    last = Some(msg);
+                }
+                thread::sleep(Duration::from_millis(8));
             }
         })
         .ok();

@@ -6,12 +6,14 @@
 mod cursor;
 mod dxgi;
 mod gdi;
+mod system_cursor;
 
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 pub use dxgi::{Dxgi, enumerate};
 pub use gdi::Gdi;
+pub use system_cursor::{CursorImage, CursorState, cursor_image, cursor_state};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
@@ -84,6 +86,8 @@ pub struct Capturer {
     gdi: Option<Gdi>,
     retry_dxgi_at: Instant,
     last: Backend,
+    /// Pintar el puntero dentro de la imagen (visores antiguos). Si no, va aparte.
+    with_cursor: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -110,6 +114,7 @@ impl Capturer {
             gdi: None,
             retry_dxgi_at: Instant::now(),
             last: Backend::None,
+            with_cursor: true,
         };
         match Dxgi::new(idx) {
             Ok(d) => {
@@ -139,12 +144,26 @@ impl Capturer {
         }
     }
 
+    /// `false`: el puntero no se pinta en la imagen (el visor lo dibuja aparte) y moverlo no produce
+    /// fotogramas nuevos.
+    pub fn set_with_cursor(&mut self, on: bool) {
+        self.with_cursor = on;
+        if let Some(d) = self.dxgi.as_mut() {
+            d.set_with_cursor(on);
+        }
+        if let Some(g) = self.gdi.as_mut() {
+            g.with_cursor = on;
+        }
+    }
+
     pub fn backend(&self) -> Backend {
         if self.dxgi.is_some() { Backend::Dxgi } else { Backend::Gdi }
     }
 
     fn start_gdi(&mut self) -> Result<(), CaptureError> {
-        self.gdi = Some(Gdi::new(self.display.x, self.display.y, self.display.width, self.display.height)?);
+        let mut gdi = Gdi::new(self.display.x, self.display.y, self.display.width, self.display.height)?;
+        gdi.with_cursor = self.with_cursor;
+        self.gdi = Some(gdi);
         Ok(())
     }
 
@@ -152,7 +171,8 @@ impl Capturer {
     pub fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame<'_>>, CaptureError> {
         if self.dxgi.is_none() && Instant::now() >= self.retry_dxgi_at {
             match Dxgi::new(self.display.index) {
-                Ok(d) => {
+                Ok(mut d) => {
+                    d.set_with_cursor(self.with_cursor);
                     info!("DXGI recuperado monitor {} {}x{}", self.display.index, d.width(), d.height());
                     self.dxgi = Some(d);
                     self.gdi = None;

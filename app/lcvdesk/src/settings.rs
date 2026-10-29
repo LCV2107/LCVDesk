@@ -1,4 +1,4 @@
-//! Preferencias ligeras (tema, canal, sonido, complementos): un archivo por ajuste en `%LOCALAPPDATA%\LCVDesk`.
+//! Preferencias ligeras (tema, canal, sonido, complementos, vista): un archivo por ajuste en `%LOCALAPPDATA%\LCVDesk`.
 
 use std::path::PathBuf;
 
@@ -65,4 +65,35 @@ pub fn load_tray_hint_shown() -> bool {
 
 pub fn save_tray_hint_shown() {
     write_file("tray_hint", "shown");
+}
+
+/// Vista guardada para un equipo remoto («fit», «width» o un porcentaje); vacía si no hay ninguna.
+/// Archivo `views`, una línea `id=vista` por equipo.
+pub fn load_view(host_id: &str) -> String {
+    let text = std::fs::read_to_string(file_in_dir("views")).unwrap_or_default();
+    text.lines().find_map(|l| l.strip_prefix(host_id)?.strip_prefix('=')).unwrap_or("").trim().to_string()
+}
+
+pub fn save_view(host_id: &str, view: &str) {
+    let text = std::fs::read_to_string(file_in_dir("views")).unwrap_or_default();
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter(|l| !l.is_empty() && l.split_once('=').is_none_or(|(id, _)| id != host_id))
+        .map(str::to_string)
+        .collect();
+    lines.push(format!("{host_id}={view}"));
+    write_file("views", &lines.join("\n"));
+}
+
+/// Tamaño del puntero remoto (1, 1.5 o 2 veces su tamaño real); 1 por defecto.
+pub fn load_cursor_scale() -> f32 {
+    std::fs::read_to_string(file_in_dir("cursor_scale"))
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|k| (1.0..=2.0).contains(k))
+        .unwrap_or(1.0)
+}
+
+pub fn save_cursor_scale(k: f32) {
+    write_file("cursor_scale", &k.to_string());
 }

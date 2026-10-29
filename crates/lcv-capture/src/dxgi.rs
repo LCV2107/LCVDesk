@@ -59,6 +59,7 @@ pub struct Dxgi {
     pointer: Pointer,
     overlay: Overlay,
     shape_buf: Vec<u8>,
+    with_cursor: bool,
 }
 
 impl Dxgi {
@@ -96,7 +97,16 @@ impl Dxgi {
             pointer: Pointer::default(),
             overlay: Overlay::default(),
             shape_buf: Vec::new(),
+            with_cursor: true,
         })
+    }
+
+    /// Pintar o no el puntero sobre la imagen. Al dejar de pintarlo se quita del último fotograma.
+    pub fn set_with_cursor(&mut self, on: bool) {
+        if !on && self.with_cursor && self.has_frame {
+            self.overlay.restore(&mut self.buf, self.width);
+        }
+        self.with_cursor = on;
     }
 
     pub fn width(&self) -> u32 {
@@ -134,13 +144,15 @@ impl Dxgi {
             // Imagen limpia recién copiada: lo que tapaba el puntero ya no importa.
             self.overlay.invalidate();
             self.has_frame = true;
-        } else if pointer_changed && self.has_frame {
+        } else if pointer_changed && self.has_frame && self.with_cursor {
             // Solo se movió el ratón: quitar el puntero de su sitio anterior.
             self.overlay.restore(&mut self.buf, self.width);
         } else {
             return Ok(false);
         }
-        self.overlay.draw(&mut self.buf, self.width, self.height, &self.pointer);
+        if self.with_cursor {
+            self.overlay.draw(&mut self.buf, self.width, self.height, &self.pointer);
+        }
         Ok(true)
     }
 

@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Versión que habla esta compilación. 3 añade el audio (`Audio`, `AudioEnable`) y las miniaturas
-/// de monitores (`PreviewRequest`, `Preview`); 4, el túnel de complementos (`Plugin*`).
-pub const PROTOCOL_VERSION: u32 = 4;
+/// de monitores (`PreviewRequest`, `Preview`); 4, el túnel de complementos (`Plugin*`); 5, el
+/// puntero aparte de la imagen (`CursorShape`, `CursorPos`).
+pub const PROTOCOL_VERSION: u32 = 5;
 /// Versión más antigua con la que se sigue hablando (sin audio). Un host acepta cualquier visor
 /// entre esta y `PROTOCOL_VERSION`; un visor nuevo que choca con un host antiguo reintenta con esta.
 pub const MIN_PROTOCOL_VERSION: u32 = 2;
@@ -15,6 +16,9 @@ pub const MIN_PROTOCOL_VERSION: u32 = 2;
 pub const AUDIO_PROTOCOL_VERSION: u32 = 3;
 /// Primera versión con complementos (IGP_Soft): solo se ofrecen si ambos lados la alcanzan.
 pub const PLUGIN_PROTOCOL_VERSION: u32 = 4;
+/// Primera versión con el puntero aparte: el host deja de pintarlo en el vídeo y el visor lo dibuja
+/// encima, siempre a su tamaño real aunque la imagen se vea reducida.
+pub const CURSOR_PROTOCOL_VERSION: u32 = 5;
 /// Motivos de `PluginError`.
 pub const PLUGIN_NOT_INSTALLED: &str = "no_instalado";
 pub const PLUGIN_NOT_RESPONDING: &str = "no_responde";
@@ -104,6 +108,26 @@ pub enum Message {
     },
     /// Un lado cerró su tubería: el otro cierra la suya (en ambos sentidos).
     PluginClose { channel: u32 },
+
+    // --- Desde la versión 5: puntero aparte del vídeo. ---
+    /// Host → visor: forma de un puntero. Se envía una vez por `id`; el visor la guarda.
+    CursorShape(CursorShape),
+    /// Host → visor: dónde está el puntero (su punto activo, en píxeles del monitor que se ve) y
+    /// qué forma tiene. `visible` es falso si está oculto o en otro monitor.
+    CursorPos { id: u64, x: i32, y: i32, visible: bool },
+}
+
+/// Imagen de un puntero en RGBA de 8 bits (sin premultiplicar).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorShape {
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    /// Punto activo (la punta de la flecha) dentro de la imagen.
+    pub hot_x: u32,
+    pub hot_y: u32,
+    #[serde(with = "serde_bytes")]
+    pub rgba: Vec<u8>,
 }
 
 /// Un complemento y su versión instalada en un equipo.
@@ -250,6 +274,23 @@ mod tests {
         assert_eq!(postcard::to_allocvec(&Message::Preview(DisplayPreview { index: 0, width: 0, height: 0, rgba: vec![] })).unwrap()[0], 20);
         assert_eq!(postcard::to_allocvec(&Message::PluginQuery).unwrap(), [21]);
         assert_eq!(postcard::to_allocvec(&Message::PluginClose { channel: 1 }).unwrap(), [27, 1]);
+        assert_eq!(postcard::to_allocvec(&Message::CursorPos { id: 0, x: 0, y: 0, visible: false }).unwrap()[0], 29);
+    }
+
+    #[test]
+    fn cursor_roundtrip() {
+        let msgs = [
+            Message::CursorShape(CursorShape { id: 65539, width: 1, height: 1, hot_x: 0, hot_y: 0, rgba: vec![0, 0, 0, 255] }),
+            Message::CursorPos { id: 65539, x: -3, y: 1079, visible: true },
+        ];
+        let mut wire = Vec::new();
+        for m in &msgs {
+            write_message(&mut wire, m).unwrap();
+        }
+        let mut cursor = io::Cursor::new(wire);
+        for m in &msgs {
+            assert_eq!(&read_message(&mut cursor).unwrap(), m);
+        }
     }
 
     #[test]

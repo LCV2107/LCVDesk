@@ -20,6 +20,8 @@ pub struct Gdi {
     has_frame: bool,
     /// (handle del cursor, punto activo x, y) del último cursor dibujado.
     cursor_hotspot: (isize, i32, i32),
+    /// Pintar el puntero en la imagen (si no, el visor lo dibuja aparte).
+    pub(crate) with_cursor: bool,
 }
 
 // Los handles GDI pertenecen a este objeto y solo se usan desde el hilo que lo posee.
@@ -69,6 +71,7 @@ impl Gdi {
                 buf: vec![0; width as usize * height as usize * 4],
                 has_frame: false,
                 cursor_hotspot: (0, 0, 0),
+                with_cursor: true,
             })
         }
     }
@@ -83,7 +86,9 @@ impl Gdi {
             )
             .map_err(|e| CaptureError::Gdi(e.to_string()))?;
             // BitBlt no copia el puntero: se dibuja encima (y así moverlo cuenta como cambio).
-            self.draw_cursor();
+            if self.with_cursor {
+                self.draw_cursor();
+            }
             let _ = GdiFlush();
             // SAFETY: la sección DIB tiene exactamente ancho × alto × 4 bytes y vive mientras `self`.
             let src = std::slice::from_raw_parts(self.bits, self.buf.len());
