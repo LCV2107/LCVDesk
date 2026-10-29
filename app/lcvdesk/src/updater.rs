@@ -131,7 +131,7 @@ impl Updater {
                         }
                         // El instalador corre elevado en su propio proceso; cerramos para no bloquear archivos.
                         std::thread::sleep(Duration::from_millis(600));
-                        ctx2.send_viewport_cmd(egui::ViewportCommand::Close);
+                        crate::tray::quit(&ctx2);
                     }
                     Err(e) => {
                         set(Status::Error(e));

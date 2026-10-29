@@ -57,3 +57,12 @@ pub fn load_plugins_allowed() -> bool {
 pub fn save_plugins_allowed(on: bool) {
     write_file("plugins", if on { "on" } else { "off" });
 }
+
+/// ¿Ya se explicó (una vez) que cerrar la ventana deja LCVDesk en la bandeja?
+pub fn load_tray_hint_shown() -> bool {
+    file_in_dir("tray_hint").exists()
+}
+
+pub fn save_tray_hint_shown() {
+    write_file("tray_hint", "shown");
+}

@@ -10,6 +10,7 @@ mod keymap;
 mod plugins;
 mod recents;
 mod settings;
+mod tray;
 mod uac;
 mod ui;
 mod updater;
@@ -80,15 +81,17 @@ fn already_running() -> bool {
     }
 }
 
-/// Trae al frente la ventana de la instancia que ya está en marcha (restaurándola si está minimizada).
+/// Trae al frente la ventana de la instancia que ya está en marcha: la muestra si estaba oculta en la
+/// bandeja y la restaura si estaba minimizada.
 fn focus_existing_window() {
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow,
+        FindWindowW, IsIconic, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
     };
     use windows::core::{PCWSTR, w};
     unsafe {
         if let Ok(hwnd) = FindWindowW(PCWSTR::null(), w!("LCVDesk")) {
             if !hwnd.0.is_null() {
+                let _ = ShowWindow(hwnd, SW_SHOW);
                 if IsIconic(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
                 }

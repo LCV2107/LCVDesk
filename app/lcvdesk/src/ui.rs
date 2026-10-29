@@ -110,8 +110,26 @@ pub fn run(host: Host, discovery: Discovery) -> anyhow::Result<()> {
         present_mode: eframe::wgpu::PresentMode::AutoVsync,
         desired_maximum_frame_latency: Some(1),
     };
-    eframe::run_native("LCVDesk", options, Box::new(|_cc| Ok(Box::new(App::new(host, discovery)))))
-        .map_err(|e| anyhow::anyhow!("no se pudo abrir la ventana: {e}"))
+    let result = eframe::run_native(
+        "LCVDesk",
+        options,
+        Box::new(|cc| {
+            // Icono en la bandeja: cerrar la ventana deja LCVDesk abierto y recibiendo conexiones.
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            match cc.window_handle().map(|h| h.as_raw()) {
+                Ok(RawWindowHandle::Win32(h)) => {
+                    let name = hostname::get().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let ip = local_ip().unwrap_or_else(|| "sin red".into());
+                    crate::tray::start(h.hwnd.get(), host.clone(), cc.egui_ctx.clone(), name, ip);
+                }
+                other => tracing::warn!("bandeja: no se obtuvo la ventana ({other:?}); sin icono en la bandeja"),
+            }
+            Ok(Box::new(App::new(host, discovery)))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("no se pudo abrir la ventana: {e}"));
+    crate::tray::remove();
+    result
 }
 
 struct App {
@@ -529,7 +547,7 @@ impl App {
                             self.updater.install(r.clone(), ui.ctx().clone());
                         }
                         if ui.button("Salir").clicked() {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            crate::tray::quit(ui.ctx());
                         }
                     });
                 }
@@ -1103,6 +1121,16 @@ impl eframe::App for App {
         if !self.update_checked {
             self.update_checked = true;
             self.check_updates(ui.ctx());
+        }
+        // Cerrar la ventana la deja en la bandeja (sigue recibiendo conexiones). Solo se sale de
+        // verdad con «Salir» del icono o al instalar una actualización.
+        if ui.ctx().input(|i| i.viewport().close_requested()) && crate::tray::active() && !crate::tray::quitting() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            // Si estabas controlando otro equipo, esa sesión termina al cerrar su ventana.
+            if let Some(v) = self.viewer.as_ref() {
+                v.disconnect();
+            }
+            crate::tray::hide_main();
         }
         let critical = self.found_release().filter(|r| r.critical);
         self.status_strip(ui);
