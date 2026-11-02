@@ -1,4 +1,4 @@
-# Restringe (o reabre) la regla de firewall de LCVDesk a rangos de red concretos.
+# Restringe (o reabre) la regla de firewall de IGPDesk a rangos de red concretos.
 # Ejecutar como administrador DESPUÉS de instalar el MSI.
 #
 # Ejemplos:
@@ -11,11 +11,13 @@ param(
     [int]$DiscoveryPort = 47071
 )
 $ErrorActionPreference = 'Stop'
-$name = 'LCVDesk (TCP 47070)'
-$discoName = 'LCVDesk (descubrimiento UDP 47071)'
+$name = 'IGPDesk (TCP 47070)'
+$discoName = 'IGPDesk (descubrimiento UDP 47071)'
 
-Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-Get-NetFirewallRule -DisplayName $discoName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+# También las de antes del cambio de nombre (LCVDesk), por si quedó alguna creada con este script.
+foreach ($n in $name, $discoName, 'LCVDesk (TCP 47070)', 'LCVDesk (descubrimiento UDP 47071)') {
+    Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+}
 
 if ($Reset -or -not $Ranges) {
     New-NetFirewallRule -DisplayName $name -Direction Inbound -Action Allow `

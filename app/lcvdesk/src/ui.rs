@@ -1,5 +1,6 @@
 //! Ventana principal: estado del equipo, conexión a otro equipo, vista remota y control.
 
+use crate::APP_NAME;
 use crate::discovery::Discovery;
 use crate::host::Host;
 use crate::keyhook;
@@ -97,7 +98,7 @@ const RED: Color32 = Color32::from_rgb(214, 78, 70);
 pub fn run(host: Host, discovery: Discovery) -> anyhow::Result<()> {
     let mut options = eframe::NativeOptions::default();
     options.viewport = egui::ViewportBuilder::default()
-        .with_title("LCVDesk")
+        .with_title(APP_NAME)
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([520.0, 360.0]);
     // Icono de la ventana (barra de tareas y Alt+Tab).
@@ -111,10 +112,10 @@ pub fn run(host: Host, discovery: Discovery) -> anyhow::Result<()> {
         desired_maximum_frame_latency: Some(1),
     };
     let result = eframe::run_native(
-        "LCVDesk",
+        APP_NAME,
         options,
         Box::new(|cc| {
-            // Icono en la bandeja: cerrar la ventana deja LCVDesk abierto y recibiendo conexiones.
+            // Icono en la bandeja: cerrar la ventana deja el programa abierto y recibiendo conexiones.
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
             match cc.window_handle().map(|h| h.as_raw()) {
                 Ok(RawWindowHandle::Win32(h)) => {
@@ -363,7 +364,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             ui.vertical(|ui| {
-                ui.label(RichText::new("LCVDesk").strong().size(22.0).color(pal.accent));
+                ui.label(RichText::new(APP_NAME).strong().size(22.0).color(pal.accent));
                 ui.label(RichText::new(format!("v{}", updater::current_version())).small().color(pal.text_muted));
             });
         });
@@ -477,7 +478,7 @@ impl App {
     }
 
     fn page_plugins(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        page_header(ui, pal, "Complementos", "Programas que LCVDesk conecta entre los dos equipos durante una sesión.");
+        page_header(ui, pal, "Complementos", &format!("Programas que {APP_NAME} conecta entre los dos equipos durante una sesión."));
         card(ui, pal, "IGP_Soft", Some("Maneja desde tu IGP_Soft las pantallas del equipo que controlas."), |ui| {
             self.plugins_section(ui, pal)
         });
@@ -497,7 +498,7 @@ impl App {
     }
 
     fn page_settings(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        page_header(ui, pal, "Ajustes", "Preferencias de LCVDesk en este equipo.");
+        page_header(ui, pal, "Ajustes", &format!("Preferencias de {APP_NAME} en este equipo."));
         card(ui, pal, "Apariencia", None, |ui| {
             ui.horizontal(|ui| {
                 setting_label(ui, pal, "Tema");
@@ -617,7 +618,7 @@ impl App {
         ui.vertical_centered(|ui| {
             ui.label(RichText::new("⚠ Actualización obligatoria").size(26.0).strong().color(RED));
             ui.add_space(8.0);
-            ui.label("Esta versión incluye un cambio crítico. Debes actualizar para seguir usando LCVDesk.");
+            ui.label(format!("Esta versión incluye un cambio crítico. Debes actualizar para seguir usando {APP_NAME}."));
             ui.add_space(6.0);
             ui.label(RichText::new(format!("Nueva versión: {}", r.version)).strong());
             if !r.notes.is_empty() {
@@ -632,7 +633,7 @@ impl App {
                 }
                 Status::Installing => {
                     ui.spinner();
-                    ui.label("Instalando… LCVDesk se cerrará para aplicar la actualización.");
+                    ui.label(format!("Instalando… {APP_NAME} se cerrará para aplicar la actualización."));
                 }
                 _ => {
                     if let Status::Error(e) = &phase {
@@ -680,7 +681,7 @@ impl App {
         section_header(ui, "En la red", pal);
         ui.add_space(6.0);
         if found.is_empty() {
-            ui.label(RichText::new("Buscando equipos con LCVDesk en tu red…").small().color(pal.text_muted));
+            ui.label(RichText::new(format!("Buscando equipos con {APP_NAME} en tu red…")).small().color(pal.text_muted));
         } else {
             let mut connect = None;
             ui.horizontal_wrapped(|ui| {
@@ -835,7 +836,7 @@ impl App {
             Status::Installing => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Instalando… LCVDesk se cerrará y volverá a abrirlo tras actualizar.");
+                    ui.label(format!("Instalando… {APP_NAME} se cerrará y volverá a abrirse tras actualizar."));
                 });
             }
             Status::Error(e) => {
@@ -996,7 +997,7 @@ impl App {
                     }
                     keyhook::Health::Failed => {
                         ui.colored_label(ORANGE, "⚠ Sin hook de teclado: Win y Alt+Tab no se envían")
-                            .on_hover_text("Windows rechazó el hook de teclado. Detalles en %LOCALAPPDATA%\\LCVDesk\\lcvdesk.log");
+                            .on_hover_text(format!("Windows rechazó el hook de teclado. Detalles en %LOCALAPPDATA%\\{APP_NAME}\\igpdesk.log"));
                     }
                 }
                 // Sonido del equipo remoto (solo si su versión de LCVDesk lo envía).
@@ -1420,7 +1421,7 @@ fn plugins_button(ui: &mut egui::Ui, viewer: &Viewer, local: Option<&plugins::In
     };
     if !supported {
         ui.add_enabled(false, egui::Button::new("🔌 Complementos"))
-            .on_disabled_hover_text("El equipo remoto tiene una versión de LCVDesk sin complementos: actualízalo.");
+            .on_disabled_hover_text(format!("El equipo remoto tiene una versión de {APP_NAME} sin complementos: actualízalo."));
         return;
     }
     let title = match &state {
@@ -1834,7 +1835,7 @@ fn monitor_preview(ui: &mut egui::Ui, d: &lcv_proto::DisplayInfo, tex: Option<&T
                 ui.add(egui::Image::new(egui::load::SizedTexture::new(t.id(), size)).corner_radius(6));
             }
             None if !supported => {
-                ui.add(egui::Label::new("Actualiza LCVDesk en el equipo remoto para ver la vista previa.").wrap());
+                ui.add(egui::Label::new(format!("Actualiza {APP_NAME} en el equipo remoto para ver la vista previa.")).wrap());
             }
             None => {
                 let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());

@@ -1,4 +1,4 @@
-//! Preferencias ligeras (tema, canal, sonido, complementos, vista): un archivo por ajuste en `%LOCALAPPDATA%\LCVDesk`.
+//! Preferencias ligeras (tema, canal, sonido, complementos, vista): un archivo por ajuste en `%LOCALAPPDATA%\IGPDesk`.
 
 use std::path::PathBuf;
 
@@ -34,11 +34,7 @@ pub fn save_audio(on: bool) {
 }
 
 fn file_in_dir(name: &str) -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("LCVDesk")
-        .join(name)
+    crate::data_dir().join(name)
 }
 
 fn write_file(name: &str, value: &str) {

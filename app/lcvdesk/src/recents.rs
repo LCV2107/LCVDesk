@@ -1,4 +1,4 @@
-//! Lista de equipos recientes/guardados en `%LOCALAPPDATA%\LCVDesk\devices.json`.
+//! Lista de equipos recientes/guardados en `%LOCALAPPDATA%\IGPDesk\devices.json`.
 //!
 //! Cada conexión con éxito se guarda automáticamente. La clave es el identificador de equipo
 //! (estable), así que se reconoce aunque cambie la IP. Se pueden marcar favoritos o quitar.
@@ -20,11 +20,7 @@ pub struct SavedDevice {
 }
 
 fn file() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("LCVDesk")
-        .join("devices.json")
+    crate::data_dir().join("devices.json")
 }
 
 /// Carga la lista, ordenada: primero favoritos, luego por conexión más reciente.

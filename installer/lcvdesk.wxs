@@ -1,11 +1,13 @@
 <!--
-  Instalador MSI de LCVDesk (WiX Toolset 5).
+  Instalador MSI de IGPDesk, antes LCVDesk (WiX Toolset 5).
+  El UpgradeCode y la identidad de la barra de tareas (LCVDesk.App) no cambian con el nombre: así
+  IGPDesk se instala encima de LCVDesk, sin quedar como un segundo programa.
   Se genera con tools\build-msi.ps1; las variables Version y BinDir llegan desde ese script.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
-  <Package Name="LCVDesk"
-           Manufacturer="LCVDesk"
+  <Package Name="IGPDesk"
+           Manufacturer="IGPDesk"
            Version="$(Version)"
            UpgradeCode="934321C7-3C9D-40DE-B5CF-742C669601B6"
            Scope="perMachine">
@@ -14,20 +16,20 @@
          vez de desinstalar primero; así el acceso directo no se elimina y el anclaje no se rompe. -->
     <MajorUpgrade AllowSameVersionUpgrades="yes"
                   Schedule="afterInstallExecute"
-                  DowngradeErrorMessage="Ya hay instalada una versión más reciente de LCVDesk." />
+                  DowngradeErrorMessage="Ya hay instalada una versión más reciente de IGPDesk." />
     <MediaTemplate EmbedCab="yes" />
 
     <Property Id="ARPNOMODIFY" Value="1" />
     <Property Id="ARPURLINFOABOUT" Value="Uso interno - AGPL-3.0" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="LCVDesk" />
+      <Directory Id="INSTALLFOLDER" Name="IGPDesk" />
     </StandardDirectory>
 
     <ComponentGroup Id="Main" Directory="INSTALLFOLDER">
       <Component Id="LcvdeskExe">
-        <File Id="LcvdeskExe" Source="$(BinDir)\lcvdesk.exe" KeyPath="yes">
-          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="LCVDesk"
+        <File Id="LcvdeskExe" Source="$(BinDir)\IGPDesk.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="IGPDesk"
                     Description="Escritorio remoto en la red local" WorkingDirectory="INSTALLFOLDER">
             <!-- Misma identidad que fija la app (SetCurrentProcessExplicitAppUserModelID): el anclaje
                  a la barra de tareas se mantiene aunque se actualice la aplicación. -->
@@ -36,18 +38,18 @@
           <!-- Conexiones entrantes del visor. Se permite en los perfiles Privado y de Dominio
                (redes de la oficina, aunque haya varias subredes), no en redes públicas.
                Para restringirlo a rangos concretos, usar tools\firewall.ps1 tras instalar. -->
-          <fw:FirewallException Id="FwLcvdeskTcp" Name="LCVDesk (TCP 47070)"
-                                Description="Conexiones de escritorio remoto LCVDesk en la red de la oficina"
+          <fw:FirewallException Id="FwLcvdeskTcp" Name="IGPDesk (TCP 47070)"
+                                Description="Conexiones de escritorio remoto IGPDesk en la red de la oficina"
                                 Protocol="tcp" Port="47070" Scope="any" Profile="domain" />
-          <fw:FirewallException Id="FwLcvdeskTcpPrivate" Name="LCVDesk (TCP 47070)"
-                                Description="Conexiones de escritorio remoto LCVDesk en la red de la oficina"
+          <fw:FirewallException Id="FwLcvdeskTcpPrivate" Name="IGPDesk (TCP 47070)"
+                                Description="Conexiones de escritorio remoto IGPDesk en la red de la oficina"
                                 Protocol="tcp" Port="47070" Scope="any" Profile="private" />
           <!-- Descubrimiento de equipos en la red local (UDP multicast 239.255.47.71:47071). -->
-          <fw:FirewallException Id="FwLcvdeskUdp" Name="LCVDesk (descubrimiento UDP 47071)"
-                                Description="Descubrimiento de equipos LCVDesk en la red de la oficina"
+          <fw:FirewallException Id="FwLcvdeskUdp" Name="IGPDesk (descubrimiento UDP 47071)"
+                                Description="Descubrimiento de equipos IGPDesk en la red de la oficina"
                                 Protocol="udp" Port="47071" Scope="any" Profile="domain" />
-          <fw:FirewallException Id="FwLcvdeskUdpPrivate" Name="LCVDesk (descubrimiento UDP 47071)"
-                                Description="Descubrimiento de equipos LCVDesk en la red de la oficina"
+          <fw:FirewallException Id="FwLcvdeskUdpPrivate" Name="IGPDesk (descubrimiento UDP 47071)"
+                                Description="Descubrimiento de equipos IGPDesk en la red de la oficina"
                                 Protocol="udp" Port="47071" Scope="any" Profile="private" />
         </File>
       </Component>
@@ -55,6 +57,21 @@
         <File Id="LicenseFile" Source="LICENSE" Name="LICENSE.txt" />
       </Component>
     </ComponentGroup>
+
+    <!-- Al pasar de LCVDesk a IGPDesk: el actualizador de las versiones anteriores vuelve a abrir
+         C:\Program Files\LCVDesk\lcvdesk.exe, que ya no existe. Si ese archivo estaba antes de
+         instalar, el propio instalador abre IGPDesk al terminar, a través de explorer.exe para que
+         no se abra como administrador. -->
+    <Property Id="OLDLCVDESK">
+      <DirectorySearch Id="OldLcvdeskDir" Path="[ProgramFiles64Folder]LCVDesk" Depth="0">
+        <FileSearch Id="OldLcvdeskExe" Name="lcvdesk.exe" />
+      </DirectorySearch>
+    </Property>
+    <CustomAction Id="LaunchAfterRename" Directory="INSTALLFOLDER" Execute="immediate" Return="asyncNoWait"
+                  ExeCommand="&quot;[WindowsFolder]explorer.exe&quot; &quot;[#LcvdeskExe]&quot;" />
+    <InstallExecuteSequence>
+      <Custom Action="LaunchAfterRename" After="InstallFinalize" Condition="OLDLCVDESK AND NOT REMOVE" />
+    </InstallExecuteSequence>
 
     <Feature Id="Main">
       <ComponentGroupRef Id="Main" />

@@ -58,9 +58,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $version = "${{ github.ref_name }}".TrimStart('v')
-          $msi = "dist\LCVDesk-$version-x64.msi"
+          $msi = "dist\IGPDesk-$version-x64.msi"
           $notes = "notas.md"
-          if (-not (Test-Path $notes)) { "LCVDesk $version" | Set-Content $notes -Encoding utf8 }
-          $args = @("${{ github.ref_name }}", $msi, "$msi.sha256", '--title', "LCVDesk $version", '--notes-file', $notes)
+          if (-not (Test-Path $notes)) { "IGPDesk $version" | Set-Content $notes -Encoding utf8 }
+          $args = @("${{ github.ref_name }}", $msi, "$msi.sha256", '--title', "IGPDesk $version", '--notes-file', $notes)
           if ($version -match '-') { $args += '--prerelease' }   # beta/rc ⇒ prerelease
           gh release create @args

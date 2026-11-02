@@ -6,11 +6,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 fn id_file() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("LCVDesk")
-        .join("identity")
+    crate::data_dir().join("identity")
 }
 
 /// Identificador del equipo (16 bytes en hexadecimal). Se crea una vez y se reutiliza.

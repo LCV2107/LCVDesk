@@ -16,7 +16,13 @@ mod ui;
 mod updater;
 mod viewer;
 
+use std::path::PathBuf;
 use std::sync::Mutex;
+
+/// Nombre visible del programa: ventana, bandeja, instalador y carpetas.
+pub const APP_NAME: &str = "IGPDesk";
+/// Nombre anterior: se usa solo para traer los datos de las versiones que se llamaban así.
+const OLD_NAME: &str = "LCVDesk";
 
 fn main() -> anyhow::Result<()> {
     // Antes de crear ventanas o duplicar la salida DXGI: coordenadas reales, sin virtualizar por DPI.
@@ -27,14 +33,18 @@ fn main() -> anyhow::Result<()> {
         // Identidad estable en la barra de tareas: así el anclaje sobrevive a las actualizaciones.
         let _ = windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(windows::core::w!("LCVDesk.App"));
     }
+    let migrated = migrate_data_dir();
     init_logging();
-    tracing::info!("LCVDesk {} iniciado", updater::current_version());
+    tracing::info!("{APP_NAME} {} iniciado", updater::current_version());
+    if migrated {
+        tracing::info!("datos copiados desde %LOCALAPPDATA%\\{OLD_NAME}");
+    }
 
-    // Instancia única: si LCVDesk ya está abierto (p. ej. tras un relanzado por actualización o un
+    // Instancia única: si el programa ya está abierto (p. ej. tras un relanzado por actualización o un
     // doble clic), la segunda copia trae al frente la ventana existente y sale, en vez de pelearse
     // por los puertos 47070/47071 y fallar con el error 10048. Comportamiento tipo AnyDesk.
     // Solo en compilaciones de desarrollo: permite abrir una segunda copia (con otro LCVDESK_PORT)
-    // junto al LCVDesk instalado, para probar la interfaz sin cerrarlo.
+    // junto a la versión instalada, para probar la interfaz sin cerrarlo.
     let dev_multi = cfg!(debug_assertions) && std::env::var_os("LCVDESK_DEV_MULTI").is_some();
     if !dev_multi && already_running() {
         tracing::info!("ya hay una instancia en marcha; traigo su ventana al frente y salgo");
@@ -62,7 +72,7 @@ pub fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-/// ¿Hay ya otra instancia de LCVDesk en marcha? Se comprueba con un mutex con nombre de sesión:
+/// ¿Hay ya otra instancia en marcha? Se comprueba con un mutex con nombre de sesión:
 /// la primera instancia lo crea y lo conserva; una segunda ve que ya existe.
 fn already_running() -> bool {
     use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
@@ -87,9 +97,9 @@ fn focus_existing_window() {
     use windows::Win32::UI::WindowsAndMessaging::{
         FindWindowW, IsIconic, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
     };
-    use windows::core::{PCWSTR, w};
+    use windows::core::PCWSTR;
     unsafe {
-        if let Ok(hwnd) = FindWindowW(PCWSTR::null(), w!("LCVDesk")) {
+        if let Ok(hwnd) = FindWindowW(PCWSTR::null(), &windows::core::HSTRING::from(APP_NAME)) {
             if !hwnd.0.is_null() {
                 let _ = ShowWindow(hwnd, SW_SHOW);
                 if IsIconic(hwnd).as_bool() {
@@ -101,14 +111,45 @@ fn focus_existing_window() {
     }
 }
 
-/// Registro en `%LOCALAPPDATA%\LCVDesk\lcvdesk.log` (se reinicia en cada arranque).
+/// Carpeta de datos del programa: `%LOCALAPPDATA%\IGPDesk` (identidad, contraseñas, equipos, ajustes).
+pub fn data_dir() -> PathBuf {
+    local_app_data().join(APP_NAME)
+}
+
+fn local_app_data() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+}
+
+/// La primera vez tras el cambio de nombre copia `%LOCALAPPDATA%\LCVDesk` a la carpeta nueva, para que
+/// el equipo conserve su identidad, las contraseñas guardadas y la lista de equipos. Copia en vez de
+/// mover: si se vuelve a una versión anterior (que aún usa la carpeta vieja), sigue teniendo sus datos.
+fn migrate_data_dir() -> bool {
+    let (old, new) = (local_app_data().join(OLD_NAME), data_dir());
+    if new.exists() || !old.is_dir() {
+        return false;
+    }
+    copy_dir(&old, &new).is_ok()
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else if entry.file_name() != "lcvdesk.log" {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Registro en `%LOCALAPPDATA%\IGPDesk\igpdesk.log` (se reinicia en cada arranque).
 fn init_logging() {
-    let dir = std::env::var_os("LOCALAPPDATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("LCVDesk");
+    let dir = data_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let Ok(file) = std::fs::File::create(dir.join("lcvdesk.log")) else { return };
+    let Ok(file) = std::fs::File::create(dir.join("igpdesk.log")) else { return };
     tracing_subscriber::fmt().with_writer(Mutex::new(file)).with_ansi(false).with_thread_names(true).init();
     std::panic::set_hook(Box::new(|info| tracing::error!("pánico: {info}")));
 }

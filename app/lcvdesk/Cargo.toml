@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# El paquete sigue llamándose lcvdesk (cargo run -p lcvdesk); el ejecutable lleva el nombre visible.
+[[bin]]
+name = "IGPDesk"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 eframe = "0.37.0"

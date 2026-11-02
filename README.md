@@ -1,4 +1,7 @@
-# LCVDesk
+# IGPDesk
+
+Antes LCVDesk. El programa instalado, su carpeta, su ejecutable y su carpeta de datos se llaman IGPDesk;
+el código interno (paquete `lcvdesk`, crates `lcv-*`) y el repositorio conservan el nombre anterior.
 
 Escritorio remoto para PCs Windows de una misma red local (LAN). Sin servidores externos, sin relay.
 Uso interno de la oficina. Licencia: [AGPL-3.0](LICENSE).
@@ -32,7 +35,8 @@ Objetivo: latencia mínima (15–30 ms extremo a extremo en LAN gigabit).
 | 4.5 Portapapeles y archivos | Pendiente |
 | Actualización por GitHub (updater) | Implementada — requiere fijar el repositorio |
 | Complemento IGP_Soft (manejar las pantallas del remoto desde IGP_Soft) | Implementado (0.4.0-beta.1) — en pruebas ([docs/IGP_SOFT.md](docs/IGP_SOFT.md)) |
-| Pantallas grandes (2K, 4K, panorámicas): vista ajustada, al ancho o a tamaño real con zoom; puntero aparte del vídeo, siempre a tamaño real (protocolo v5) | Implementado — en pruebas, sin publicar |
+| Pantallas grandes (2K, 4K, panorámicas): vista ajustada, al ancho o a tamaño real con zoom; puntero aparte del vídeo, siempre a tamaño real (protocolo v5) | Implementado (0.4.0-beta.4) — en pruebas |
+| Nombre visible IGPDesk: ventana, bandeja, instalador, carpeta, ejecutable y datos (se copian desde LCVDesk) | Implementado — en pruebas, sin publicar |
 
 ## Requisitos de compilación
 
@@ -46,7 +50,7 @@ Objetivo: latencia mínima (15–30 ms extremo a extremo en LAN gigabit).
 ```powershell
 cargo run -p lcvdesk            # ejecutar en modo desarrollo
 cargo test                      # pruebas
-.\tools\build-msi.ps1           # release + dist\LCVDesk-<versión>-x64.msi
+.\tools\build-msi.ps1           # release + dist\IGPDesk-<versión>-x64.msi
 ```
 
 ## Estructura

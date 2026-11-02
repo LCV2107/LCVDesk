@@ -179,7 +179,7 @@ fn list_releases() -> Result<Vec<(Ver, Release, bool)>, String> {
     let url = format!("https://api.github.com/repos/{}/releases?per_page=30", repo());
     let body = agent()
         .get(&url)
-        .set("User-Agent", "LCVDesk-Updater")
+        .set("User-Agent", "IGPDesk-Updater")
         .set("Accept", "application/vnd.github+json")
         .call()
         .map_err(|e| describe(e))?
@@ -237,7 +237,7 @@ fn download_and_verify(
 ) -> Result<std::path::PathBuf, String> {
     let resp = agent()
         .get(&release.msi_url)
-        .set("User-Agent", "LCVDesk-Updater")
+        .set("User-Agent", "IGPDesk-Updater")
         .call()
         .map_err(|e| describe(e))?;
     let total = resp
@@ -246,9 +246,9 @@ fn download_and_verify(
         .filter(|&n| n > 0)
         .unwrap_or(release.size);
 
-    let dir = std::env::temp_dir().join("LCVDesk");
+    let dir = std::env::temp_dir().join(crate::APP_NAME);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(format!("LCVDesk-{}-x64.msi", release.version));
+    let path = dir.join(format!("{}-{}-x64.msi", crate::APP_NAME, release.version));
 
     let mut reader = resp.into_reader();
     let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
@@ -279,7 +279,7 @@ fn download_and_verify(
     if let Some(sha_url) = &release.sha_url {
         let expected = agent()
             .get(sha_url)
-            .set("User-Agent", "LCVDesk-Updater")
+            .set("User-Agent", "IGPDesk-Updater")
             .call()
             .map_err(|e| describe(e))?
             .into_string()
@@ -299,7 +299,7 @@ fn download_and_verify(
 /// Código de actualización del MSI (`UpgradeCode` en installer\lcvdesk.wxs).
 const UPGRADE_CODE: &str = "{934321C7-3C9D-40DE-B5CF-742C669601B6}";
 
-/// Instala la actualización (elevado) y, al terminar, vuelve a abrir LCVDesk con el nivel del usuario.
+/// Instala la actualización (elevado) y, al terminar, vuelve a abrir el programa con el nivel del usuario.
 ///
 /// Lo hace un script de PowerShell que primero **espera a que esta instancia se cierre**: si msiexec
 /// corre con el .exe aún abierto, no puede reemplazarlo y lo deja para el reinicio (te quedabas en la
@@ -313,7 +313,7 @@ fn launch_installer(path: &std::path::Path, downgrade: bool) -> Result<(), Strin
     use windows::core::{PCWSTR, w};
 
     let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into());
-    let exe = format!("{program_files}\\LCVDesk\\lcvdesk.exe");
+    let exe = format!("{program_files}\\{app}\\{app}.exe", app = crate::APP_NAME);
     // Cadenas de PowerShell entre comillas simples: la comilla simple se escapa duplicándola.
     let q = |s: &str| s.replace('\'', "''");
     let uninstall = if downgrade {
@@ -336,7 +336,7 @@ fn launch_installer(path: &std::path::Path, downgrade: bool) -> Result<(), Strin
         msi = q(&path.display().to_string()),
         exe = q(&exe),
     );
-    let script_path = path.with_file_name("lcvdesk-update.ps1");
+    let script_path = path.with_file_name("igpdesk-update.ps1");
     // Con BOM, para que PowerShell 5 lea bien rutas con caracteres no ASCII.
     std::fs::write(&script_path, [&[0xEF, 0xBB, 0xBF][..], script.as_bytes()].concat()).map_err(|e| e.to_string())?;
 

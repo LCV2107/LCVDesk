@@ -18,6 +18,9 @@ fn main() {
         res.set_version_info(winresource::VersionInfo::FILEVERSION, packed);
         res.set_version_info(winresource::VersionInfo::PRODUCTVERSION, packed);
         res.set("ProductVersion", &version);
+        // Nombre que muestran el Administrador de tareas y las propiedades del archivo.
+        res.set("ProductName", "IGPDesk");
+        res.set("FileDescription", "IGPDesk");
         if let Err(e) = res.compile() {
             println!("cargo:warning=no se pudo incrustar el icono/versión: {e}");
         }

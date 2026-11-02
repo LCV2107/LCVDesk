@@ -4,7 +4,7 @@
 //! `HMAC-SHA256(contraseña, nonce)`. La contraseña **nunca viaja por la red**, ni siquiera cifrada,
 //! así que funciona aunque el canal todavía no tenga cifrado E2E (Fase 4.4).
 //!
-//! La contraseña del host se guarda en `%LOCALAPPDATA%\LCVDesk\access.bin` protegida con DPAPI
+//! La contraseña del host se guarda en `%LOCALAPPDATA%\IGPDesk\access.bin` protegida con DPAPI
 //! (ligada al usuario de Windows): otro usuario u otra máquina no pueden descifrarla.
 
 use sha2::{Digest, Sha256};
@@ -73,11 +73,7 @@ pub fn random_nonce() -> Vec<u8> {
 }
 
 fn access_file() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("LCVDesk")
-        .join("access.bin")
+    crate::data_dir().join("access.bin")
 }
 
 /// ¿El host tiene una contraseña de acceso configurada?
@@ -115,14 +111,10 @@ pub fn clear_password() -> bool {
 }
 
 // --- Contraseñas recordadas por equipo (para "entrar automáticamente") ---
-// Se guardan en %LOCALAPPDATA%\LCVDesk\passwords.json como { id_equipo: blob_DPAPI_en_hex }.
+// Se guardan en %LOCALAPPDATA%\IGPDesk\passwords.json como { id_equipo: blob_DPAPI_en_hex }.
 
 fn creds_file() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("LCVDesk")
-        .join("passwords.json")
+    crate::data_dir().join("passwords.json")
 }
 
 fn load_creds() -> std::collections::HashMap<String, String> {

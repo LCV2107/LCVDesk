@@ -1,4 +1,4 @@
-# Compila LCVDesk en release y genera dist\LCVDesk-<versión>-x64.msi
+# Compila IGPDesk (paquete lcvdesk) en release y genera dist\IGPDesk-<versión>-x64.msi
 # Requisitos: Rust (MSVC), Windows SDK, WiX 5 (dotnet tool install --global wix --version 5.0.2)
 # y la extensión de firewall (wix extension add -g WixToolset.Firewall.wixext/5.0.2).
 #
@@ -36,7 +36,7 @@ try {
         if ($LASTEXITCODE) { throw 'cargo build falló' }
     }
     New-Item -ItemType Directory -Force dist | Out-Null
-    $msi = "dist\LCVDesk-$Version-x64.msi"
+    $msi = "dist\IGPDesk-$Version-x64.msi"
     wix build installer\lcvdesk.wxs -arch x64 -ext WixToolset.Firewall.wixext `
         -d Version=$base -d BinDir=target\release -o $msi
     if ($LASTEXITCODE) { throw 'wix build falló' }

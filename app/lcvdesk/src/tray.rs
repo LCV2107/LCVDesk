@@ -1,10 +1,11 @@
-//! Icono en la bandeja de Windows. Cerrar la ventana no cierra LCVDesk: se oculta y sigue
+//! Icono en la bandeja de Windows. Cerrar la ventana no cierra el programa: se oculta y sigue
 //! recibiendo conexiones (como AnyDesk). Desde el icono se vuelve a abrir o se sale del todo.
 //!
 //! Un hilo propio crea una ventana oculta (solo para recibir los avisos del icono) con su bucle de
 //! mensajes. La ventana principal de eframe se oculta y se muestra con `ShowWindow` directamente:
 //! mientras está oculta, eframe no dibuja y no atendería órdenes de su propia cola.
 
+use crate::APP_NAME;
 use crate::host::Host;
 use eframe::egui;
 use std::sync::OnceLock;
@@ -68,7 +69,7 @@ pub fn start(main: isize, host: Host, ctx: egui::Context, name: String, ip: Stri
         .name("tray".into())
         .spawn(|| {
             if let Err(e) = run() {
-                warn!("bandeja: no se pudo poner el icono ({e}); cerrar la ventana cerrará LCVDesk");
+                warn!("bandeja: no se pudo poner el icono ({e}); cerrar la ventana cerrará el programa");
             }
         })
         .ok();
@@ -84,22 +85,22 @@ pub fn quitting() -> bool {
     QUITTING.load(Ordering::SeqCst)
 }
 
-/// Sale de LCVDesk (no a la bandeja): menú «Salir», instalar una actualización.
+/// Sale del programa (no a la bandeja): menú «Salir», instalar una actualización.
 pub fn quit(ctx: &egui::Context) {
     QUITTING.store(true, Ordering::SeqCst);
     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     ctx.request_repaint();
 }
 
-/// Oculta la ventana principal. La primera vez explica que LCVDesk sigue en la bandeja.
+/// Oculta la ventana principal. La primera vez explica que el programa sigue en la bandeja.
 pub fn hide_main() {
     let main = HWND(MAIN.load(Ordering::SeqCst) as _);
     let _ = unsafe { ShowWindow(main, SW_HIDE) };
-    info!("ventana oculta: LCVDesk sigue en la bandeja");
+    info!("ventana oculta: sigue en la bandeja");
     if !crate::settings::load_tray_hint_shown() {
         crate::settings::save_tray_hint_shown();
         balloon(
-            "LCVDesk sigue abierto",
+            &format!("{APP_NAME} sigue abierto"),
             "Sigue recibiendo conexiones desde la bandeja. Para cerrarlo del todo: clic derecho en el icono → Salir.",
         );
     }
@@ -190,7 +191,7 @@ fn run() -> windows::core::Result<()> {
         }
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::SeqCst);
         // Ventana de nivel superior que nunca se muestra (las ventanas «solo mensajes» no reciben
-        // TaskbarCreated). Sin título, para que no la confunda la búsqueda de la ventana «LCVDesk».
+        // TaskbarCreated). Sin título, para que no la confunda la búsqueda de la ventana principal por su título.
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
@@ -246,10 +247,10 @@ fn app_icon() -> HICON {
 }
 
 fn tooltip() -> String {
-    let Some(s) = STATE.get() else { return "LCVDesk".into() };
+    let Some(s) = STATE.get() else { return APP_NAME.into() };
     match s.host.state().session.as_ref() {
-        Some(session) => format!("LCVDesk — «{}» está controlando este equipo", session.name),
-        None => format!("LCVDesk — {} ({})", s.name, s.ip),
+        Some(session) => format!("{APP_NAME} — «{}» está controlando este equipo", session.name),
+        None => format!("{APP_NAME} — {} ({})", s.name, s.ip),
     }
 }
 
@@ -319,7 +320,7 @@ fn menu(hwnd: HWND) {
         };
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, &HSTRING::from(status));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN, w!("Abrir LCVDesk"));
+        let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN, &HSTRING::from(format!("Abrir {APP_NAME}")));
         if let Some(name) = &controlled_by {
             let _ = AppendMenuW(menu, MF_STRING, CMD_DISCONNECT, &HSTRING::from(format!("Desconectar a «{name}»")));
         }
