@@ -24,9 +24,11 @@ pub fn save_channel(value: &str) {
     write_file("channel", value);
 }
 
-/// ¿Reproducir el sonido del equipo remoto? Activado por defecto.
+/// ¿Reproducir aquí el sonido del equipo remoto? Desactivado por defecto: lo normal es estar en la
+/// misma sala que el equipo controlado (videowall), que ya suena por sus altavoces, y la copia que
+/// llega por la red se oiría dos veces y con retraso.
 pub fn load_audio() -> bool {
-    std::fs::read_to_string(file_in_dir("audio")).map(|s| s.trim() != "off").unwrap_or(true)
+    std::fs::read_to_string(file_in_dir("audio")).map(|s| s.trim() == "on").unwrap_or(false)
 }
 
 pub fn save_audio(on: bool) {
@@ -43,6 +45,15 @@ fn write_file(name: &str, value: &str) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(path, value);
+}
+
+/// ¿Abrir el programa (en la bandeja) al iniciar sesión en Windows? Activado por defecto.
+pub fn load_autostart() -> bool {
+    std::fs::read_to_string(file_in_dir("autostart")).map(|s| s.trim() != "off").unwrap_or(true)
+}
+
+pub fn save_autostart(on: bool) {
+    write_file("autostart", if on { "on" } else { "off" });
 }
 
 /// ¿Permitir que quien controla este equipo abra complementos (IGP_Soft)? Activado por defecto.

@@ -171,6 +171,10 @@ struct App {
     controlling: bool,
     /// Captura de teclado activa: todas las teclas (Windows, Alt+Tab…) van al equipo remoto.
     capture: bool,
+    /// Abrir el programa al iniciar sesión en Windows (persistido).
+    autostart: bool,
+    /// Arrancó al iniciar sesión: la ventana se oculta en la bandeja en cuanto el icono esté puesto.
+    start_in_tray: Option<std::time::Instant>,
     /// Tema de la interfaz (persistido).
     theme: Theme,
     /// Canal de actualizaciones (persistido).
@@ -284,6 +288,8 @@ impl App {
             view_pct: 100.0,
             cursor_textures: Default::default(),
             cursor_scale: crate::settings::load_cursor_scale(),
+            autostart: crate::settings::load_autostart(),
+            start_in_tray: crate::autostart::started_in_tray().then(std::time::Instant::now),
         }
     }
 
@@ -510,6 +516,27 @@ impl App {
                     }
                 }
             });
+        });
+        card(ui, pal, "Inicio", None, |ui| {
+            if ui.checkbox(&mut self.autostart, format!("Abrir {APP_NAME} al iniciar Windows")).changed() {
+                crate::settings::save_autostart(self.autostart);
+                // Las compilaciones de desarrollo no tocan el registro (ver autostart::sync).
+                if !cfg!(debug_assertions)
+                    && let Err(e) = crate::autostart::set(self.autostart)
+                {
+                    tracing::warn!("arranque con Windows: {e}");
+                }
+            }
+            ui.label(
+                RichText::new(
+                    "Se abre en la bandeja al iniciar sesión y queda listo para recibir conexiones.                      Si el equipo se queda en la pantalla de bloqueo, hay que iniciar sesión primero.",
+                )
+                .small()
+                .color(pal.text_muted),
+            );
+            if !cfg!(debug_assertions) && self.autostart != crate::autostart::is_registered() {
+                ui.label(RichText::new("Windows no aceptó el cambio. Detalles en el registro del programa.").small().color(pal.warning_text));
+            }
         });
         card(ui, pal, "Actualizaciones", None, |ui| {
             ui.label(RichText::new(format!("Versión instalada: {}", updater::current_version())).color(pal.text_strong));
@@ -1000,11 +1027,17 @@ impl App {
                             .on_hover_text(format!("Windows rechazó el hook de teclado. Detalles en %LOCALAPPDATA%\\{APP_NAME}\\igpdesk.log"));
                     }
                 }
-                // Sonido del equipo remoto (solo si su versión de LCVDesk lo envía).
+                // Copia aquí del sonido del equipo remoto (solo si su versión lo envía). No silencia el
+                // equipo remoto: allí sigue sonando por sus altavoces.
                 if viewer.shared().audio_supported {
                     let on = viewer.audio_on();
-                    let (txt, col) = if on { ("🔊 Sonido", GREEN) } else { ("🔇 Silenciado", Color32::GRAY) };
-                    if ui.button(RichText::new(txt).color(col)).on_hover_text("Oír lo que suena en el equipo remoto").clicked() {
+                    let (txt, col) = if on { ("🔊 Oyendo aquí", GREEN) } else { ("🔇 Sonido en el remoto", Color32::GRAY) };
+                    let hint = if on {
+                        "El sonido del equipo remoto también se reproduce en este equipo. Clic para dejar de oírlo aquí                          (en el equipo remoto sigue sonando)."
+                    } else {
+                        "El sonido se oye en los altavoces del equipo remoto. Clic para oírlo también en este equipo."
+                    };
+                    if ui.button(RichText::new(txt).color(col)).on_hover_text(hint).clicked() {
                         viewer.set_audio(!on);
                     }
                 }
@@ -1342,6 +1375,18 @@ impl eframe::App for App {
         // Sin esto, el hook de teclado no recibe nada mientras nuestra ventana está delante.
         keyhook::maintain();
         self.apply_theme(ui.ctx());
+        // eframe muestra la ventana tras pintar el primer fotograma, así que se oculta en el siguiente.
+        // Sin icono en la bandeja (tras unos segundos) se deja visible: si no, no habría cómo abrirla.
+        if let Some(since) = self.start_in_tray {
+            if ui.ctx().cumulative_frame_nr() >= 1 && crate::tray::active() {
+                crate::tray::hide_main_quiet();
+                self.start_in_tray = None;
+            } else if since.elapsed() > Duration::from_secs(5) {
+                self.start_in_tray = None;
+            } else {
+                ui.ctx().request_repaint_after(Duration::from_millis(50));
+            }
+        }
         // Comprobación automática de actualizaciones, una vez al arrancar.
         if !self.update_checked {
             self.update_checked = true;

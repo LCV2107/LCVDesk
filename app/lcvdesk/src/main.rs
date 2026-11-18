@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod auth;
+mod autostart;
 mod discovery;
 mod host;
 mod identity;
@@ -51,6 +52,8 @@ fn main() -> anyhow::Result<()> {
         focus_existing_window();
         return Ok(());
     }
+
+    autostart::sync();
 
     // Hook de teclado de bajo nivel para reenviar las teclas del sistema (tecla Windows, Alt+Tab…)
     // al equipo remoto mientras controlas, en vez de que las procese este PC.

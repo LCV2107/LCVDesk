@@ -70,6 +70,8 @@ pub fn start(main: isize, host: Host, ctx: egui::Context, name: String, ip: Stri
         .spawn(|| {
             if let Err(e) = run() {
                 warn!("bandeja: no se pudo poner el icono ({e}); cerrar la ventana cerrará el programa");
+                // Si arrancó oculto (inicio de sesión), sin icono no habría forma de abrirlo.
+                show_main();
             }
         })
         .ok();
@@ -92,11 +94,16 @@ pub fn quit(ctx: &egui::Context) {
     ctx.request_repaint();
 }
 
-/// Oculta la ventana principal. La primera vez explica que el programa sigue en la bandeja.
-pub fn hide_main() {
+/// Oculta la ventana sin avisar (arranque al iniciar sesión).
+pub fn hide_main_quiet() {
     let main = HWND(MAIN.load(Ordering::SeqCst) as _);
     let _ = unsafe { ShowWindow(main, SW_HIDE) };
     info!("ventana oculta: sigue en la bandeja");
+}
+
+/// Oculta la ventana principal. La primera vez explica que el programa sigue en la bandeja.
+pub fn hide_main() {
+    hide_main_quiet();
     if !crate::settings::load_tray_hint_shown() {
         crate::settings::save_tray_hint_shown();
         balloon(

@@ -36,7 +36,8 @@ Objetivo: latencia mínima (15–30 ms extremo a extremo en LAN gigabit).
 | Actualización por GitHub (updater) | Implementada — requiere fijar el repositorio |
 | Complemento IGP_Soft (manejar las pantallas del remoto desde IGP_Soft) | Implementado (0.4.0-beta.1) — en pruebas ([docs/IGP_SOFT.md](docs/IGP_SOFT.md)) |
 | Pantallas grandes (2K, 4K, panorámicas): vista ajustada, al ancho o a tamaño real con zoom; puntero aparte del vídeo, siempre a tamaño real (protocolo v5) | Implementado (0.4.0-beta.4) — en pruebas |
-| Nombre visible IGPDesk: ventana, bandeja, instalador, carpeta, ejecutable y datos (se copian desde LCVDesk) | Implementado — en pruebas, sin publicar |
+| Nombre visible IGPDesk: ventana, bandeja, instalador, carpeta, ejecutable y datos (se copian desde LCVDesk) | Publicado (0.4.0) |
+| Arranque con Windows en la bandeja (Ajustes → Inicio, activado por defecto); sonido del remoto apagado por defecto en el equipo que controla | Implementado — en pruebas, sin publicar (0.5.0) |
 
 ## Requisitos de compilación
 
